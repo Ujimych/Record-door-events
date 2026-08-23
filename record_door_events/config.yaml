@@ -13,8 +13,6 @@ arch:
   - amd64
   - aarch64
 
-image: "ghcr.io/ujimych/record-door-events"
-
 options:
   rtsp_url: ""
 
