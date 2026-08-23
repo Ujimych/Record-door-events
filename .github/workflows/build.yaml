@@ -8,7 +8,7 @@ on:
 
 env:
   ARCHITECTURES: '["amd64", "aarch64"]'
-  IMAGE_NAME: ghcr.io/ujimych/record-door-events
+  IMAGE_NAME: record-door-events
 
 permissions: {}
 
