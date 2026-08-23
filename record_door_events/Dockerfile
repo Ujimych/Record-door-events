@@ -1,8 +1,4 @@
-FROM ghcr.io/home-assistant/base:3.23
-
-ARG BUILD_VERSION
-
-ENV APP_VERSION="${BUILD_VERSION}"
+FROM alpine:3.22
 
 RUN apk add --no-cache \
     bash \
