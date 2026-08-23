@@ -189,6 +189,10 @@ Example automation:
           🚪 Door opened
           {{ now().strftime('%d.%m.%Y %H:%M:%S') }}
 
+    - action: shell_command.record_door_events_delete_video
+      data:
+        filename: "{{ trigger.payload }}"
+
   mode: queued
   max: 20
 ```
