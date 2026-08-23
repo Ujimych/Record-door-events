@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import json
-import os
 import time
 import uuid
 import shutil
@@ -12,16 +11,6 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import paho.mqtt.client as mqtt
-
-
-# ==================================================
-# Version
-# ==================================================
-
-APP_VERSION = os.environ.get(
-    "APP_VERSION",
-    "unknown"
-)
 
 
 # ==================================================
@@ -1173,7 +1162,7 @@ def process_event(event_file):
 def main():
 
     log(
-        f"Event processor {APP_VERSION} started."
+        "Event processor started."
     )
 
     log(
