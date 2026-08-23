@@ -1,0 +1,93 @@
+name: Build Record Door Events
+
+on:
+  release:
+    types: [published]
+
+  workflow_dispatch:
+
+env:
+  ARCHITECTURES: '["amd64", "aarch64"]'
+  IMAGE_NAME: ghcr.io/ujimych/record-door-events
+
+permissions: {}
+
+jobs:
+
+  init:
+    name: Initialize build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.06.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          image-name: ${{ env.IMAGE_NAME }}
+
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: init
+
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build image
+        uses: home-assistant/builder/actions/build-image@2026.06.0
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ github.event.release.tag_name || 'manual' }}
+          push: "true"
+          version: ${{ github.event.release.tag_name || 'manual' }}
+
+
+  manifest:
+    name: Publish multi-architecture manifest
+    needs:
+      - init
+      - build
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+      id-token: write
+
+    steps:
+
+      - name: Publish multi-architecture manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.06.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tags: |
+            ${{ github.event.release.tag_name || 'manual' }}
