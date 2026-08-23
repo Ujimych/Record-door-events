@@ -17,29 +17,13 @@ import paho.mqtt.client as mqtt
 # Paths
 # ==================================================
 
-BUFFER_DIR = Path(
-    "/media/record-door-events/buffer"
-)
+BUFFER_DIR = Path("/media/record-door-events/buffer")
+EVENT_DIR = Path("/media/record-door-events/events")
+RECORD_DIR = Path("/media/record-door-events/recordings")
+READY_DIR = Path("/media/record-door-events/ready")
+TEMP_DIR = Path("/media/record-door-events/tmp")
 
-EVENT_DIR = Path(
-    "/media/record-door-events/events"
-)
-
-RECORD_DIR = Path(
-    "/media/record-door-events/recordings"
-)
-
-READY_DIR = Path(
-    "/media/record-door-events/ready"
-)
-
-TEMP_DIR = Path(
-    "/media/record-door-events/tmp"
-)
-
-OPTIONS_FILE = Path(
-    "/data/options.json"
-)
+OPTIONS_FILE = Path("/data/options.json")
 
 
 # ==================================================
@@ -47,7 +31,6 @@ OPTIONS_FILE = Path(
 # ==================================================
 
 def log(message):
-
     print(
         f"[event-processor] {message}",
         flush=True
@@ -100,6 +83,12 @@ TARGET_DURATION = (
     POST_EVENT
 )
 
+MAX_WORKERS = 10
+
+MQTT_TOPIC = "record_door_events/video_ready"
+
+mqtt_client = None
+
 
 # ==================================================
 # Ready retention
@@ -108,7 +97,7 @@ TARGET_DURATION = (
 READY_RETENTION_DAYS = int(
     OPTIONS.get(
         "ready_retention_days",
-        7
+        3
     )
 )
 
@@ -118,19 +107,6 @@ READY_RETENTION_SECONDS = (
     60 *
     60
 )
-
-
-# ==================================================
-# Processing
-# ==================================================
-
-MAX_WORKERS = 10
-
-MQTT_TOPIC = (
-    "record_door_events/video_ready"
-)
-
-mqtt_client = None
 
 
 # ==================================================
@@ -171,9 +147,7 @@ def mqtt_connect():
     try:
 
         mqtt_client = mqtt.Client(
-            callback_api_version=(
-                mqtt.CallbackAPIVersion.VERSION2
-            ),
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id="record-door-events"
         )
 
@@ -211,15 +185,85 @@ def mqtt_connect():
 
 
 # ==================================================
+# Cleanup ready directory
+# ==================================================
+
+def cleanup_ready_directory():
+
+    try:
+
+        if not READY_DIR.exists():
+
+            return
+
+        now = time.time()
+
+        deleted = 0
+
+        for video_file in READY_DIR.iterdir():
+
+            if not video_file.is_file():
+
+                continue
+
+            try:
+
+                age = (
+                    now -
+                    video_file.stat().st_mtime
+                )
+
+            except FileNotFoundError:
+
+                continue
+
+            if age > READY_RETENTION_SECONDS:
+
+                try:
+
+                    video_file.unlink()
+
+                    deleted += 1
+
+                    log(
+                        f"Deleted old ready video: "
+                        f"{video_file.name}"
+                    )
+
+                except FileNotFoundError:
+
+                    pass
+
+                except Exception as e:
+
+                    log(
+                        f"Unable to delete old "
+                        f"ready video "
+                        f"{video_file.name}: {e}"
+                    )
+
+        if deleted:
+
+            log(
+                f"Ready cleanup: "
+                f"deleted {deleted} file(s)"
+            )
+
+    except Exception as e:
+
+        log(
+            f"Ready cleanup error: {e}"
+        )
+
+
+# ==================================================
 # Buffer
 # ==================================================
 
 def get_segments():
 
     return sorted(
-        BUFFER_DIR.glob(
-            "segment_*.ts"
-        ),
+        BUFFER_DIR.glob("segment_*.ts"),
         key=lambda p: p.name
     )
 
@@ -270,90 +314,6 @@ def delete_event_marker(event_file):
         log(
             f"Unable to remove event marker "
             f"{event_file.name}: {e}"
-        )
-
-
-# ==================================================
-# Ready cleanup
-# ==================================================
-
-def cleanup_ready_files():
-
-    READY_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    now = time.time()
-
-    deleted = 0
-
-    for video_file in READY_DIR.glob(
-        "*.mp4"
-    ):
-
-        try:
-
-            age = (
-                now -
-                video_file.stat().st_mtime
-            )
-
-            if age <= READY_RETENTION_SECONDS:
-                continue
-
-            video_file.unlink()
-
-            deleted += 1
-
-            log(
-                f"Old ready video removed: "
-                f"{video_file.name} "
-                f"(age={age / 86400:.1f} days)"
-            )
-
-        except FileNotFoundError:
-
-            pass
-
-        except Exception as e:
-
-            log(
-                f"Unable to remove old ready "
-                f"video {video_file.name}: {e}"
-            )
-
-    if deleted:
-
-        log(
-            f"Ready cleanup completed: "
-            f"removed {deleted} file(s)"
-        )
-
-
-def ready_cleanup_loop():
-
-    log(
-        f"Ready cleanup started: "
-        f"retention={READY_RETENTION_DAYS} day(s)"
-    )
-
-    while True:
-
-        try:
-
-            cleanup_ready_files()
-
-        except Exception as e:
-
-            log(
-                f"Ready cleanup error: {e}"
-            )
-
-        # Run once per hour.
-
-        time.sleep(
-            3600
         )
 
 
@@ -556,6 +516,10 @@ def process_event(event_file):
 
     try:
 
+        # --------------------------------------------------
+        # Event timestamp
+        # --------------------------------------------------
+
         try:
 
             event_timestamp = float(
@@ -579,6 +543,11 @@ def process_event(event_file):
             f"{datetime.fromtimestamp(event_timestamp)}"
         )
 
+
+        # --------------------------------------------------
+        # Wait until +POST_EVENT
+        # --------------------------------------------------
+
         target_time = (
             event_timestamp +
             POST_EVENT
@@ -600,9 +569,18 @@ def process_event(event_file):
                 wait_time
             )
 
+
+        # Give segmenter time to finish
+        # the current TS file.
+
         time.sleep(
             2.0
         )
+
+
+        # --------------------------------------------------
+        # Requested interval
+        # --------------------------------------------------
 
         start_time = (
             event_timestamp -
@@ -621,6 +599,11 @@ def process_event(event_file):
             f" -> "
             f"{datetime.fromtimestamp(end_time)}"
         )
+
+
+        # --------------------------------------------------
+        # Select overlapping segments
+        # --------------------------------------------------
 
         all_segments = get_segments()
 
@@ -665,8 +648,7 @@ def process_event(event_file):
         selected.sort(
             key=lambda p: (
                 get_segment_timestamp(p)
-                if get_segment_timestamp(p)
-                is not None
+                if get_segment_timestamp(p) is not None
                 else 0
             )
         )
@@ -691,6 +673,11 @@ def process_event(event_file):
             f"Event {event_file.name}: "
             f"selected {len(selected)} segments"
         )
+
+
+        # --------------------------------------------------
+        # Wait for all selected files
+        # --------------------------------------------------
 
         stable_segments = []
 
@@ -722,6 +709,11 @@ def process_event(event_file):
 
             return
 
+
+        # --------------------------------------------------
+        # Temporary directory
+        # --------------------------------------------------
+
         TEMP_DIR.mkdir(
             parents=True,
             exist_ok=True
@@ -736,6 +728,11 @@ def process_event(event_file):
             parents=True,
             exist_ok=True
         )
+
+
+        # --------------------------------------------------
+        # Copy segments
+        # --------------------------------------------------
 
         local_segments = []
 
@@ -819,6 +816,11 @@ def process_event(event_file):
                 f"{segment.name}"
             )
 
+
+        # --------------------------------------------------
+        # Concat
+        # --------------------------------------------------
+
         concat_file = (
             temp_event_dir /
             "concat.txt"
@@ -828,6 +830,11 @@ def process_event(event_file):
             concat_file,
             local_segments
         )
+
+
+        # --------------------------------------------------
+        # Intermediate video
+        # --------------------------------------------------
 
         intermediate_file = (
             temp_event_dir /
@@ -902,6 +909,11 @@ def process_event(event_file):
 
             return
 
+
+        # --------------------------------------------------
+        # Determine intermediate duration
+        # --------------------------------------------------
+
         intermediate_duration = (
             get_video_duration(
                 intermediate_file
@@ -923,6 +935,11 @@ def process_event(event_file):
             f"{intermediate_duration:.2f}s"
         )
 
+
+        # --------------------------------------------------
+        # Final output
+        # --------------------------------------------------
+
         timestamp = datetime.fromtimestamp(
             event_timestamp
         )
@@ -943,6 +960,11 @@ def process_event(event_file):
                 ".mp4"
             )
         )
+
+
+        # --------------------------------------------------
+        # Final trim
+        # --------------------------------------------------
 
         first_segment_timestamp = (
             get_segment_timestamp(
@@ -983,6 +1005,11 @@ def process_event(event_file):
             TARGET_DURATION,
             available_after_offset
         )
+
+
+        # --------------------------------------------------
+        # Final FFmpeg
+        # --------------------------------------------------
 
         final_command = [
 
@@ -1050,6 +1077,11 @@ def process_event(event_file):
 
             return
 
+
+        # --------------------------------------------------
+        # Validate
+        # --------------------------------------------------
+
         if not validate_video(
             output_file
         ):
@@ -1069,6 +1101,11 @@ def process_event(event_file):
                 pass
 
             return
+
+
+        # --------------------------------------------------
+        # Move to ready
+        # --------------------------------------------------
 
         READY_DIR.mkdir(
             parents=True,
@@ -1101,6 +1138,11 @@ def process_event(event_file):
             f"RECORDING READY: "
             f"{ready_file.name}"
         )
+
+
+        # --------------------------------------------------
+        # MQTT
+        # --------------------------------------------------
 
         if mqtt_client is None:
 
@@ -1140,6 +1182,7 @@ def process_event(event_file):
                 f"MQTT publish exception: "
                 f"{e}"
             )
+
 
     finally:
 
@@ -1190,9 +1233,10 @@ def main():
         exist_ok=True
     )
 
-    mqtt_connect()
+    # Initial cleanup
+    cleanup_ready_directory()
 
-    cleanup_ready_files()
+    mqtt_connect()
 
     executor = ThreadPoolExecutor(
         max_workers=MAX_WORKERS
@@ -1200,7 +1244,30 @@ def main():
 
     submitted = set()
 
+    last_cleanup = 0
+
     while True:
+
+        # --------------------------------------------------
+        # Periodic cleanup
+        # --------------------------------------------------
+
+        current_time = time.time()
+
+        if (
+            current_time -
+            last_cleanup
+            >= 3600
+        ):
+
+            cleanup_ready_directory()
+
+            last_cleanup = current_time
+
+
+        # --------------------------------------------------
+        # Process events
+        # --------------------------------------------------
 
         events = sorted(
             EVENT_DIR.glob(
@@ -1247,18 +1314,5 @@ def main():
 # ==================================================
 
 if __name__ == "__main__":
-
-    # The cleanup worker is deliberately
-    # started here so that the main event
-    # processor remains independent.
-
-    import threading
-
-    cleanup_thread = threading.Thread(
-        target=ready_cleanup_loop,
-        daemon=True
-    )
-
-    cleanup_thread.start()
 
     main()
