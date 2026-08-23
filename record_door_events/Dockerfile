@@ -12,7 +12,6 @@ RUN pip3 install \
     --break-system-packages \
     paho-mqtt
 
-COPY config.yaml /app/config.yaml
 COPY run.sh /run.sh
 COPY event_processor.py /event_processor.py
 
