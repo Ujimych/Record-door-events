@@ -1,0 +1,46 @@
+name: Record door events
+version: "0.7.5"
+slug: record_door_events
+
+description: "Record door events and prepare videos for sending to Telegram"
+
+url: "https://github.com/Ujimych/Record-door-events"
+
+startup: application
+boot: auto
+
+init: false
+
+arch:
+  - amd64
+  - aarch64
+
+options:
+  rtsp_url: ""
+  buffer_seconds: 60
+  segment_seconds: 1
+
+  pre_event_seconds: 5
+  post_event_seconds: 10
+
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+
+schema:
+  rtsp_url: str
+  buffer_seconds: int(30,300)
+  segment_seconds: int(1,2)
+
+  pre_event_seconds: int(0,60)
+  post_event_seconds: int(1,120)
+
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: password
+
+map:
+  - type: media
+    read_only: false
