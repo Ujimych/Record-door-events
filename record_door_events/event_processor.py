@@ -1,34 +1,56 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import time
 import uuid
 import shutil
 import subprocess
+
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import paho.mqtt.client as mqtt
 
-import os
 
+# ==================================================
+# Version
+# ==================================================
 
 APP_VERSION = os.environ.get(
     "APP_VERSION",
     "unknown"
 )
 
+
 # ==================================================
 # Paths
 # ==================================================
 
-BUFFER_DIR = Path("/media/record-door-events/buffer")
-EVENT_DIR = Path("/media/record-door-events/events")
-RECORD_DIR = Path("/media/record-door-events/recordings")
-READY_DIR = Path("/media/record-door-events/ready")
-TEMP_DIR = Path("/media/record-door-events/tmp")
+BUFFER_DIR = Path(
+    "/media/record-door-events/buffer"
+)
 
-OPTIONS_FILE = Path("/data/options.json")
+EVENT_DIR = Path(
+    "/media/record-door-events/events"
+)
+
+RECORD_DIR = Path(
+    "/media/record-door-events/recordings"
+)
+
+READY_DIR = Path(
+    "/media/record-door-events/ready"
+)
+
+TEMP_DIR = Path(
+    "/media/record-door-events/tmp"
+)
+
+OPTIONS_FILE = Path(
+    "/data/options.json"
+)
 
 
 # ==================================================
@@ -84,13 +106,6 @@ POST_EVENT = float(
     )
 )
 
-EVENT_MERGE = float(
-    OPTIONS.get(
-        "event_merge_seconds",
-        3
-    )
-)
-
 TARGET_DURATION = (
     PRE_EVENT +
     POST_EVENT
@@ -98,10 +113,40 @@ TARGET_DURATION = (
 
 
 # ==================================================
-# MQTT
+# Ready retention
 # ==================================================
 
-MQTT_TOPIC = "record_door_events/video_ready"
+READY_RETENTION_DAYS = int(
+    OPTIONS.get(
+        "ready_retention_days",
+        7
+    )
+)
+
+READY_RETENTION_SECONDS = (
+    READY_RETENTION_DAYS *
+    24 *
+    60 *
+    60
+)
+
+
+# ==================================================
+# Processing
+# ==================================================
+
+MAX_WORKERS = 10
+
+MQTT_TOPIC = (
+    "record_door_events/video_ready"
+)
+
+mqtt_client = None
+
+
+# ==================================================
+# MQTT options
+# ==================================================
 
 MQTT_HOST = OPTIONS.get(
     "mqtt_host",
@@ -125,65 +170,38 @@ MQTT_PASSWORD = OPTIONS.get(
     ""
 )
 
-mqtt_client = None
-
 
 # ==================================================
-# MQTT connection
+# MQTT
 # ==================================================
-
-def mqtt_disconnect():
-
-    global mqtt_client
-
-    if mqtt_client is None:
-        return
-
-    try:
-        mqtt_client.loop_stop()
-
-    except Exception:
-        pass
-
-    try:
-        mqtt_client.disconnect()
-
-    except Exception:
-        pass
-
-    mqtt_client = None
-
 
 def mqtt_connect():
 
     global mqtt_client
 
-    mqtt_disconnect()
-
     try:
 
-        client = mqtt.Client(
-            callback_api_version=
-            mqtt.CallbackAPIVersion.VERSION2,
+        mqtt_client = mqtt.Client(
+            callback_api_version=(
+                mqtt.CallbackAPIVersion.VERSION2
+            ),
             client_id="record-door-events"
         )
 
         if MQTT_USERNAME:
 
-            client.username_pw_set(
+            mqtt_client.username_pw_set(
                 MQTT_USERNAME,
                 MQTT_PASSWORD
             )
 
-        client.connect(
+        mqtt_client.connect(
             MQTT_HOST,
             MQTT_PORT,
             60
         )
 
-        client.loop_start()
-
-        mqtt_client = client
+        mqtt_client.loop_start()
 
         log(
             f"MQTT connected: "
@@ -203,93 +221,16 @@ def mqtt_connect():
         return False
 
 
-def mqtt_publish(video_file):
-
-    global mqtt_client
-
-    for attempt in range(1, 4):
-
-        if mqtt_client is None:
-
-            if not mqtt_connect():
-
-                log(
-                    f"MQTT unavailable, "
-                    f"attempt {attempt}/3"
-                )
-
-                time.sleep(2)
-
-                continue
-
-        try:
-
-            result = mqtt_client.publish(
-                MQTT_TOPIC,
-                str(video_file),
-                qos=1,
-                retain=False
-            )
-
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-
-                log(
-                    f"MQTT publish failed: "
-                    f"rc={result.rc}"
-                )
-
-                mqtt_disconnect()
-
-                time.sleep(2)
-
-                continue
-
-            try:
-
-                result.wait_for_publish(
-                    timeout=10
-                )
-
-            except Exception:
-
-                pass
-
-            if result.is_published():
-
-                log(
-                    f"MQTT published: "
-                    f"{video_file}"
-                )
-
-                return True
-
-            log(
-                "MQTT publish timeout"
-            )
-
-            mqtt_disconnect()
-
-        except Exception as e:
-
-            log(
-                f"MQTT publish exception: {e}"
-            )
-
-            mqtt_disconnect()
-
-        time.sleep(2)
-
-    return False
-
-
 # ==================================================
-# Segment helpers
+# Buffer
 # ==================================================
 
 def get_segments():
 
     return sorted(
-        BUFFER_DIR.glob("segment_*.ts"),
+        BUFFER_DIR.glob(
+            "segment_*.ts"
+        ),
         key=lambda p: p.name
     )
 
@@ -299,7 +240,8 @@ def get_segment_timestamp(segment):
     try:
 
         timestamp_string = (
-            segment.stem.replace(
+            segment.stem
+            .replace(
                 "segment_",
                 ""
             )
@@ -315,12 +257,130 @@ def get_segment_timestamp(segment):
         return None
 
 
+# ==================================================
+# Event marker
+# ==================================================
+
+def delete_event_marker(event_file):
+
+    try:
+
+        event_file.unlink()
+
+        log(
+            f"Event marker removed: "
+            f"{event_file.name}"
+        )
+
+    except FileNotFoundError:
+
+        pass
+
+    except Exception as e:
+
+        log(
+            f"Unable to remove event marker "
+            f"{event_file.name}: {e}"
+        )
+
+
+# ==================================================
+# Ready cleanup
+# ==================================================
+
+def cleanup_ready_files():
+
+    READY_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    now = time.time()
+
+    deleted = 0
+
+    for video_file in READY_DIR.glob(
+        "*.mp4"
+    ):
+
+        try:
+
+            age = (
+                now -
+                video_file.stat().st_mtime
+            )
+
+            if age <= READY_RETENTION_SECONDS:
+                continue
+
+            video_file.unlink()
+
+            deleted += 1
+
+            log(
+                f"Old ready video removed: "
+                f"{video_file.name} "
+                f"(age={age / 86400:.1f} days)"
+            )
+
+        except FileNotFoundError:
+
+            pass
+
+        except Exception as e:
+
+            log(
+                f"Unable to remove old ready "
+                f"video {video_file.name}: {e}"
+            )
+
+    if deleted:
+
+        log(
+            f"Ready cleanup completed: "
+            f"removed {deleted} file(s)"
+        )
+
+
+def ready_cleanup_loop():
+
+    log(
+        f"Ready cleanup started: "
+        f"retention={READY_RETENTION_DAYS} day(s)"
+    )
+
+    while True:
+
+        try:
+
+            cleanup_ready_files()
+
+        except Exception as e:
+
+            log(
+                f"Ready cleanup error: {e}"
+            )
+
+        # Run once per hour.
+
+        time.sleep(
+            3600
+        )
+
+
+# ==================================================
+# Wait for segment to become stable
+# ==================================================
+
 def wait_for_segment(
     segment,
     timeout=5.0
 ):
 
-    deadline = time.time() + timeout
+    deadline = (
+        time.time() +
+        timeout
+    )
 
     last_size = -1
     stable_count = 0
@@ -371,315 +431,7 @@ def wait_for_segment(
 
 
 # ==================================================
-# Event helpers
-# ==================================================
-
-def get_event_timestamp(event_file):
-
-    try:
-
-        return float(
-            event_file.stem.replace(
-                "event_",
-                ""
-            )
-        )
-
-    except Exception:
-
-        return None
-
-
-def get_event_files():
-
-    result = []
-
-    for path in EVENT_DIR.glob("event_*.evt"):
-
-        timestamp = get_event_timestamp(path)
-
-        if timestamp is None:
-            continue
-
-        result.append(
-            (timestamp, path)
-        )
-
-    result.sort(
-        key=lambda item: item[0]
-    )
-
-    return result
-
-
-def delete_event_marker(event_file):
-
-    try:
-
-        event_file.unlink()
-
-        log(
-            f"Event marker removed: "
-            f"{event_file.name}"
-        )
-
-        return True
-
-    except FileNotFoundError:
-
-        return True
-
-    except Exception as e:
-
-        log(
-            f"Unable to remove event marker "
-            f"{event_file.name}: {e}"
-        )
-
-        return False
-
-
-# ==================================================
-# Copy segment
-# ==================================================
-
-def copy_segment(
-    segment,
-    temp_event_dir
-):
-
-    if not segment.exists():
-
-        return None
-
-    if not wait_for_segment(
-        segment,
-        timeout=5.0
-    ):
-
-        log(
-            f"Segment not ready: "
-            f"{segment.name}"
-        )
-
-        return None
-
-    destination = (
-        temp_event_dir /
-        segment.name
-    )
-
-    try:
-
-        shutil.copyfile(
-            segment,
-            destination
-        )
-
-    except FileNotFoundError:
-
-        return None
-
-    except Exception as e:
-
-        log(
-            f"Unable to copy "
-            f"{segment.name}: {e}"
-        )
-
-        return None
-
-    try:
-
-        if destination.stat().st_size <= 0:
-
-            destination.unlink(
-                missing_ok=True
-            )
-
-            return None
-
-    except Exception:
-
-        return None
-
-    return destination
-
-
-# ==================================================
-# Copy pre-event segments
-# ==================================================
-
-def copy_pre_event_segments(
-    event_timestamp,
-    temp_event_dir
-):
-
-    start_time = (
-        event_timestamp -
-        PRE_EVENT
-    )
-
-    segments = get_segments()
-
-    selected = []
-
-    previous = None
-
-    for segment in segments:
-
-        timestamp = get_segment_timestamp(
-            segment
-        )
-
-        if timestamp is None:
-            continue
-
-        if timestamp <= start_time:
-
-            previous = segment
-
-        if (
-            timestamp >= start_time
-            and
-            timestamp <= event_timestamp
-        ):
-
-            selected.append(segment)
-
-    if previous is not None:
-
-        if previous not in selected:
-
-            selected.insert(
-                0,
-                previous
-            )
-
-    selected.sort(
-        key=lambda p:
-        get_segment_timestamp(p)
-        or 0
-    )
-
-    copied = []
-
-    for segment in selected:
-
-        local = copy_segment(
-            segment,
-            temp_event_dir
-        )
-
-        if local is not None:
-
-            copied.append(local)
-
-    return copied
-
-
-# ==================================================
-# Copy final segments
-# ==================================================
-
-def copy_all_required_segments(
-    start_time,
-    end_time,
-    temp_event_dir
-):
-
-    segments = get_segments()
-
-    selected = []
-
-    previous = None
-
-    for segment in segments:
-
-        timestamp = get_segment_timestamp(
-            segment
-        )
-
-        if timestamp is None:
-            continue
-
-        if timestamp <= start_time:
-
-            previous = segment
-
-        if (
-            timestamp >= start_time
-            and
-            timestamp <= end_time
-        ):
-
-            selected.append(segment)
-
-    if previous is not None:
-
-        if previous not in selected:
-
-            selected.insert(
-                0,
-                previous
-            )
-
-    selected.sort(
-        key=lambda p:
-        get_segment_timestamp(p)
-        or 0
-    )
-
-    copied = []
-
-    for segment in selected:
-
-        local = copy_segment(
-            segment,
-            temp_event_dir
-        )
-
-        if local is not None:
-
-            copied.append(local)
-
-    return copied
-
-
-# ==================================================
-# Concat
-# ==================================================
-
-def create_concat_file(
-    concat_file,
-    segments
-):
-
-    with concat_file.open(
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        f.write(
-            "ffconcat version 1.0\n"
-        )
-
-        for segment in segments:
-
-            path = str(
-                segment
-            ).replace(
-                "'",
-                "'\\''"
-            )
-
-            f.write(
-                f"file '{path}'\n"
-            )
-
-
-# ==================================================
-# Video duration
+# Probe video duration
 # ==================================================
 
 def get_video_duration(video_file):
@@ -700,23 +452,12 @@ def get_video_duration(video_file):
         str(video_file)
     ]
 
-    try:
-
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15
-        )
-
-    except Exception as e:
-
-        log(
-            f"ffprobe exception: {e}"
-        )
-
-        return None
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
 
     if result.returncode != 0:
 
@@ -734,7 +475,7 @@ def get_video_duration(video_file):
 
 
 # ==================================================
-# Video validation
+# Validate video
 # ==================================================
 
 def validate_video(video_file):
@@ -754,8 +495,8 @@ def validate_video(video_file):
     if size < 10000:
 
         log(
-            f"Video too small: "
-            f"{size} bytes"
+            f"Video validation failed: "
+            f"file too small ({size} bytes)"
         )
 
         return False
@@ -779,13 +520,7 @@ def validate_video(video_file):
         f"duration={duration:.2f}s"
     )
 
-    if duration < max(
-        1.0,
-        min(
-            5.0,
-            TARGET_DURATION
-        )
-    ):
+    if duration < 5.0:
 
         log(
             f"Video validation failed: "
@@ -798,463 +533,553 @@ def validate_video(video_file):
 
 
 # ==================================================
-# Build video
+# Create concat list
 # ==================================================
 
-def build_video(
-    event_timestamp,
-    temp_event_dir,
-    local_segments
+def create_concat_file(
+    concat_file,
+    segments
 ):
 
-    if not local_segments:
+    with concat_file.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
 
-        log(
-            "No local segments available"
+        f.write(
+            "ffconcat version 1.0\n"
         )
 
-        return None
+        for segment in segments:
 
-    local_segments.sort(
-        key=lambda p:
-        get_segment_timestamp(p)
-        or 0
-    )
-
-    first_timestamp = get_segment_timestamp(
-        local_segments[0]
-    )
-
-    if first_timestamp is None:
-
-        log(
-            "Unable to determine "
-            "first segment timestamp"
-        )
-
-        return None
-
-    concat_file = (
-        temp_event_dir /
-        "concat.ffconcat"
-    )
-
-    create_concat_file(
-        concat_file,
-        local_segments
-    )
-
-    combined_file = (
-        temp_event_dir /
-        "combined.ts"
-    )
-
-    # One and only one video encoding pass.
-    #
-    # We first create a continuous elementary
-    # transport stream and then perform the final
-    # trim/MP4 creation in the same FFmpeg process.
-    #
-    # This replaces the previous:
-    #
-    # segments -> combined.ts
-    # combined.ts -> MP4
-    #
-    # two-encode pipeline.
-
-    timestamp = datetime.fromtimestamp(
-        event_timestamp
-    )
-
-    output_file = (
-        temp_event_dir /
-        (
-            "event_"
-            +
-            timestamp.strftime(
-                "%Y%m%d_%H%M%S"
+            f.write(
+                f"file '{segment}'\n"
             )
-            +
-            "_"
-            +
-            uuid.uuid4().hex[:6]
-            +
-            ".mp4"
-        )
-    )
 
-    trim_offset = max(
-        0.0,
-        (
-            event_timestamp -
-            PRE_EVENT -
-            first_timestamp
-        )
-    )
 
-    command = [
+# ==================================================
+# Process event
+# ==================================================
 
-        "ffmpeg",
+def process_event(event_file):
 
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-xerror",
-
-        "-f",
-        "concat",
-
-        "-safe",
-        "0",
-
-        "-i",
-        str(concat_file),
-
-        "-ss",
-        f"{trim_offset:.3f}",
-
-        "-t",
-        f"{TARGET_DURATION:.3f}",
-
-        "-an",
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "22",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-movflags",
-        "+faststart",
-
-        "-avoid_negative_ts",
-        "make_zero",
-
-        "-y",
-
-        str(output_file)
-    ]
-
-    log(
-        f"Creating video: "
-        f"offset={trim_offset:.3f}s "
-        f"duration={TARGET_DURATION:.3f}s"
-    )
+    temp_event_dir = None
 
     try:
-
-        result = subprocess.run(
-            command,
-            timeout=300
-        )
-
-    except subprocess.TimeoutExpired:
-
-        log(
-            "FFmpeg timeout while creating video"
-        )
-
-        return None
-
-    except Exception as e:
-
-        log(
-            f"FFmpeg exception: {e}"
-        )
-
-        return None
-
-    if result.returncode != 0:
-
-        log(
-            f"FFmpeg failed: "
-            f"exit code {result.returncode}"
-        )
-
-        return None
-
-    if not validate_video(
-        output_file
-    ):
 
         try:
 
-            output_file.unlink()
-
-        except FileNotFoundError:
-
-            pass
-
-        return None
-
-    return output_file
-
-
-# ==================================================
-# Wait and collect merged events
-# ==================================================
-
-def collect_event_group(
-    primary_timestamp
-):
-
-    event_files = get_event_files()
-
-    group = []
-
-    for timestamp, path in event_files:
-
-        if timestamp == primary_timestamp:
-
-            group.append(
-                path
+            event_timestamp = float(
+                event_file.stem.replace(
+                    "event_",
+                    ""
+                )
             )
 
-            break
+        except Exception as e:
 
-    if not group:
+            log(
+                f"Invalid event file "
+                f"{event_file}: {e}"
+            )
 
-        return [], primary_timestamp
+            return
 
-    latest_timestamp = primary_timestamp
+        log(
+            f"EVENT START: "
+            f"{datetime.fromtimestamp(event_timestamp)}"
+        )
 
-    deadline = (
-        latest_timestamp +
-        POST_EVENT
-    )
+        target_time = (
+            event_timestamp +
+            POST_EVENT
+        )
 
-    log(
-        f"Waiting for event group: "
-        f"post-event deadline="
-        f"{datetime.fromtimestamp(deadline)}"
-    )
+        wait_time = (
+            target_time -
+            time.time()
+        )
 
-    while True:
+        if wait_time > 0:
 
-        now = time.time()
-
-        if now < deadline:
-
-            sleep_time = min(
-                0.5,
-                deadline - now
+            log(
+                f"Event {event_file.name}: "
+                f"waiting {wait_time:.1f}s"
             )
 
             time.sleep(
-                max(
-                    0.05,
-                    sleep_time
+                wait_time
+            )
+
+        time.sleep(
+            2.0
+        )
+
+        start_time = (
+            event_timestamp -
+            PRE_EVENT
+        )
+
+        end_time = (
+            event_timestamp +
+            POST_EVENT
+        )
+
+        log(
+            f"Event {event_file.name}: "
+            f"interval "
+            f"{datetime.fromtimestamp(start_time)}"
+            f" -> "
+            f"{datetime.fromtimestamp(end_time)}"
+        )
+
+        all_segments = get_segments()
+
+        selected = []
+
+        previous_segment = None
+
+        for segment in all_segments:
+
+            segment_time = (
+                get_segment_timestamp(
+                    segment
                 )
             )
 
-        found_new = False
-
-        for timestamp, path in get_event_files():
-
-            if path in group:
-
+            if segment_time is None:
                 continue
 
-            if timestamp < latest_timestamp:
+            if segment_time <= start_time:
 
-                continue
+                previous_segment = segment
 
             if (
-                timestamp -
-                latest_timestamp
-            ) <= EVENT_MERGE:
+                segment_time >= start_time
+                and
+                segment_time <= end_time
+            ):
 
-                group.append(path)
-
-                latest_timestamp = timestamp
-
-                deadline = (
-                    latest_timestamp +
-                    POST_EVENT
+                selected.append(
+                    segment
                 )
 
-                found_new = True
+        if previous_segment is not None:
 
-                log(
-                    f"Merging event: "
-                    f"{path.name}; "
-                    f"new deadline="
-                    f"{datetime.fromtimestamp(deadline)}"
+            if previous_segment not in selected:
+
+                selected.insert(
+                    0,
+                    previous_segment
                 )
 
-        if now >= deadline and not found_new:
-
-            break
-
-    group.sort(
-        key=lambda p:
-        get_event_timestamp(p)
-        or 0
-    )
-
-    return group, latest_timestamp
-
-
-# ==================================================
-# Process event group
-# ==================================================
-
-def process_event_group(
-    primary_file
-):
-
-    primary_timestamp = get_event_timestamp(
-        primary_file
-    )
-
-    if primary_timestamp is None:
-
-        log(
-            f"Invalid event file: "
-            f"{primary_file.name}"
+        selected.sort(
+            key=lambda p: (
+                get_segment_timestamp(p)
+                if get_segment_timestamp(p)
+                is not None
+                else 0
+            )
         )
 
-        return False
-
-    log(
-        f"EVENT START: "
-        f"{datetime.fromtimestamp(primary_timestamp)}"
-    )
-
-    group, latest_event = collect_event_group(
-        primary_timestamp
-    )
-
-    if not group:
-
-        return False
-
-    start_time = (
-        primary_timestamp -
-        PRE_EVENT
-    )
-
-    end_time = (
-        latest_event +
-        POST_EVENT
-    )
-
-    log(
-        f"Event interval: "
-        f"{datetime.fromtimestamp(start_time)}"
-        f" -> "
-        f"{datetime.fromtimestamp(end_time)}"
-    )
-
-    temp_event_dir = (
-        TEMP_DIR /
-        f"event_{uuid.uuid4().hex}"
-    )
-
-    temp_event_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    try:
-
-        # --------------------------------------------------
-        # Snapshot the pre-event part immediately.
-        # This prevents the oldest required segments
-        # from disappearing from the ring buffer while
-        # we wait for the post-event period.
-        # --------------------------------------------------
-
-        copied_pre = copy_pre_event_segments(
-            primary_timestamp,
-            temp_event_dir
-        )
-
-        log(
-            f"Pre-event snapshot: "
-            f"{len(copied_pre)} segments"
-        )
-
-        # --------------------------------------------------
-        # At this point the event group has finished.
-        # Copy everything required for the final video.
-        # --------------------------------------------------
-
-        copied_all = copy_all_required_segments(
-            start_time,
-            end_time,
-            temp_event_dir
-        )
-
-        log(
-            f"Final segment snapshot: "
-            f"{len(copied_all)} segments"
-        )
-
-        if not copied_all:
+        if not selected:
 
             log(
-                "ERROR: no usable segments"
+                f"Event {event_file.name}: "
+                f"ERROR: required segments "
+                f"not found"
             )
 
-            return False
+            return
 
-        # Remove duplicates.
-        unique_segments = []
+        selected = list(
+            dict.fromkeys(
+                selected
+            )
+        )
 
-        seen_names = set()
+        log(
+            f"Event {event_file.name}: "
+            f"selected {len(selected)} segments"
+        )
 
-        for segment in (
-            copied_pre +
-            copied_all
-        ):
+        stable_segments = []
 
-            if segment.name in seen_names:
+        for segment in selected:
+
+            if wait_for_segment(
+                segment,
+                timeout=5.0
+            ):
+
+                stable_segments.append(
+                    segment
+                )
+
+            else:
+
+                log(
+                    f"Event {event_file.name}: "
+                    f"WARNING: segment not ready: "
+                    f"{segment.name}"
+                )
+
+        if not stable_segments:
+
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: no stable segments"
+            )
+
+            return
+
+        TEMP_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        temp_event_dir = (
+            TEMP_DIR /
+            f"event_{uuid.uuid4().hex}"
+        )
+
+        temp_event_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        local_segments = []
+
+        for segment in stable_segments:
+
+            if not segment.exists():
+
+                log(
+                    f"Event {event_file.name}: "
+                    f"segment disappeared: "
+                    f"{segment.name}"
+                )
 
                 continue
 
-            seen_names.add(
+            local_segment = (
+                temp_event_dir /
                 segment.name
             )
 
-            unique_segments.append(
-                segment
-            )
+            try:
 
-        unique_segments.sort(
-            key=lambda p:
-            get_segment_timestamp(p)
-            or 0
-        )
+                shutil.copyfile(
+                    segment,
+                    local_segment
+                )
+
+            except Exception as e:
+
+                log(
+                    f"Event {event_file.name}: "
+                    f"ERROR copying "
+                    f"{segment.name}: {e}"
+                )
+
+                continue
+
+            try:
+
+                size = (
+                    local_segment.stat().st_size
+                )
+
+            except Exception:
+
+                size = 0
+
+            if size <= 0:
+
+                log(
+                    f"Event {event_file.name}: "
+                    f"ERROR: empty segment: "
+                    f"{segment.name}"
+                )
+
+                continue
+
+            local_segments.append(
+                local_segment
+            )
 
         log(
-            f"Using {len(unique_segments)} "
-            f"unique segments"
+            f"Event {event_file.name}: "
+            f"copied {len(local_segments)} "
+            f"segments to temporary storage"
         )
 
-        output_file = build_video(
-            primary_timestamp,
-            temp_event_dir,
-            unique_segments
-        )
-
-        if output_file is None:
+        if not local_segments:
 
             log(
-                "ERROR: video creation failed"
+                f"Event {event_file.name}: "
+                f"ERROR: no usable segments"
             )
 
-            return False
+            return
 
-        # --------------------------------------------------
-        # Move atomically into ready/
-        # --------------------------------------------------
+        for segment in local_segments:
+
+            log(
+                f"Using segment: "
+                f"{segment.name}"
+            )
+
+        concat_file = (
+            temp_event_dir /
+            "concat.txt"
+        )
+
+        create_concat_file(
+            concat_file,
+            local_segments
+        )
+
+        intermediate_file = (
+            temp_event_dir /
+            "combined.ts"
+        )
+
+        concat_command = [
+
+            "ffmpeg",
+
+            "-hide_banner",
+
+            "-loglevel",
+            "error",
+
+            "-xerror",
+
+            "-f",
+            "concat",
+
+            "-safe",
+            "0",
+
+            "-i",
+            str(concat_file),
+
+            "-an",
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "22",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-y",
+
+            str(intermediate_file)
+        ]
+
+        log(
+            f"Event {event_file.name}: "
+            f"combining segments"
+        )
+
+        result = subprocess.run(
+            concat_command
+        )
+
+        if result.returncode != 0:
+
+            log(
+                f"Event {event_file.name}: "
+                f"FFmpeg combine ERROR: "
+                f"exit code {result.returncode}"
+            )
+
+            return
+
+        if not intermediate_file.exists():
+
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: intermediate file "
+                f"was not created"
+            )
+
+            return
+
+        intermediate_duration = (
+            get_video_duration(
+                intermediate_file
+            )
+        )
+
+        if intermediate_duration is None:
+
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: unable to determine "
+                f"intermediate duration"
+            )
+
+            return
+
+        log(
+            f"Intermediate duration: "
+            f"{intermediate_duration:.2f}s"
+        )
+
+        timestamp = datetime.fromtimestamp(
+            event_timestamp
+        )
+
+        output_file = (
+            RECORD_DIR /
+            (
+                "event_"
+                +
+                timestamp.strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+                +
+                "_"
+                +
+                uuid.uuid4().hex[:6]
+                +
+                ".mp4"
+            )
+        )
+
+        first_segment_timestamp = (
+            get_segment_timestamp(
+                stable_segments[0]
+            )
+        )
+
+        if first_segment_timestamp is None:
+
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: invalid first segment timestamp"
+            )
+
+            return
+
+        trim_offset = max(
+            0.0,
+            start_time -
+            first_segment_timestamp
+        )
+
+        available_after_offset = (
+            intermediate_duration -
+            trim_offset
+        )
+
+        if available_after_offset < TARGET_DURATION:
+
+            log(
+                f"Event {event_file.name}: "
+                f"WARNING: only "
+                f"{available_after_offset:.2f}s "
+                f"available after start offset"
+            )
+
+        final_duration = min(
+            TARGET_DURATION,
+            available_after_offset
+        )
+
+        final_command = [
+
+            "ffmpeg",
+
+            "-hide_banner",
+
+            "-loglevel",
+            "error",
+
+            "-xerror",
+
+            "-i",
+            str(intermediate_file),
+
+            "-ss",
+            f"{trim_offset:.3f}",
+
+            "-t",
+            f"{final_duration:.3f}",
+
+            "-an",
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "22",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-avoid_negative_ts",
+            "make_zero",
+
+            "-movflags",
+            "+faststart",
+
+            "-y",
+
+            str(output_file)
+        ]
+
+        log(
+            f"Event {event_file.name}: "
+            f"final trim "
+            f"offset={trim_offset:.3f}s "
+            f"duration={final_duration:.3f}s"
+        )
+
+        result = subprocess.run(
+            final_command
+        )
+
+        if result.returncode != 0:
+
+            log(
+                f"Event {event_file.name}: "
+                f"FFmpeg final trim ERROR: "
+                f"exit code {result.returncode}"
+            )
+
+            return
+
+        if not validate_video(
+            output_file
+        ):
+
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: generated video "
+                f"failed validation"
+            )
+
+            try:
+
+                output_file.unlink()
+
+            except FileNotFoundError:
+
+                pass
+
+            return
 
         READY_DIR.mkdir(
             parents=True,
@@ -1268,56 +1093,76 @@ def process_event_group(
 
         try:
 
-            output_file.replace(
+            output_file.rename(
                 ready_file
             )
 
         except Exception as e:
 
             log(
-                f"ERROR moving video to ready: {e}"
+                f"Event {event_file.name}: "
+                f"ERROR moving video to ready: "
+                f"{e}"
             )
 
-            return False
+            return
 
         log(
+            f"Event {event_file.name}: "
             f"RECORDING READY: "
             f"{ready_file.name}"
         )
 
-        # --------------------------------------------------
-        # MQTT
-        # --------------------------------------------------
-
-        if not mqtt_publish(
-            ready_file
-        ):
+        if mqtt_client is None:
 
             log(
-                "MQTT delivery failed. "
-                "Event markers will be kept "
-                "for retry."
+                "MQTT unavailable; "
+                "video remains in ready/"
             )
 
-            return False
+            return
 
-        # --------------------------------------------------
-        # Only now can event markers be deleted.
-        # --------------------------------------------------
+        try:
 
-        for event_file in group:
-
-            delete_event_marker(
-                event_file
+            result = mqtt_client.publish(
+                MQTT_TOPIC,
+                str(ready_file),
+                qos=1,
+                retain=False
             )
 
-        return True
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+
+                log(
+                    f"MQTT published: "
+                    f"{ready_file}"
+                )
+
+            else:
+
+                log(
+                    f"MQTT publish failed: "
+                    f"rc={result.rc}"
+                )
+
+        except Exception as e:
+
+            log(
+                f"MQTT publish exception: "
+                f"{e}"
+            )
 
     finally:
 
-        shutil.rmtree(
-            temp_event_dir,
-            ignore_errors=True
+        if temp_event_dir is not None:
+
+            shutil.rmtree(
+                temp_event_dir,
+                ignore_errors=True
+            )
+
+        delete_event_marker(
+            event_file
         )
 
 
@@ -1329,6 +1174,11 @@ def main():
 
     log(
         f"Event processor {APP_VERSION} started."
+    )
+
+    log(
+        f"Ready retention: "
+        f"{READY_RETENTION_DAYS} day(s)"
     )
 
     EVENT_DIR.mkdir(
@@ -1353,58 +1203,54 @@ def main():
 
     mqtt_connect()
 
-    last_retry_time = 0
+    cleanup_ready_files()
+
+    executor = ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    )
+
+    submitted = set()
 
     while True:
 
-        events = get_event_files()
-
-        if not events:
-
-            time.sleep(0.2)
-            continue
-
-        primary_timestamp, primary_file = (
-            events[0]
+        events = sorted(
+            EVENT_DIR.glob(
+                "event_*.evt"
+            )
         )
 
-        log(
-            f"Processing event: "
-            f"{primary_file.name}"
-        )
+        for event_file in events:
 
-        success = process_event_group(
-            primary_file
-        )
+            if event_file in submitted:
+                continue
 
-        if success:
-
-            last_retry_time = 0
-
-            continue
-
-        # --------------------------------------------------
-        # Do not delete failed events.
-        # Leave them in events/ and retry later.
-        # --------------------------------------------------
-
-        now = time.time()
-
-        if (
-            now -
-            last_retry_time
-            >= 5
-        ):
-
-            log(
-                f"Event processing failed: "
-                f"{primary_file.name}. "
-                f"Retrying in 5 seconds."
+            submitted.add(
+                event_file
             )
 
-            last_retry_time = now
+            log(
+                f"Submitting event: "
+                f"{event_file.name}"
+            )
 
-        time.sleep(5)
+            executor.submit(
+                process_event,
+                event_file
+            )
+
+        existing_events = set(
+            EVENT_DIR.glob(
+                "event_*.evt"
+            )
+        )
+
+        submitted.intersection_update(
+            existing_events
+        )
+
+        time.sleep(
+            0.1
+        )
 
 
 # ==================================================
@@ -1412,5 +1258,18 @@ def main():
 # ==================================================
 
 if __name__ == "__main__":
+
+    # The cleanup worker is deliberately
+    # started here so that the main event
+    # processor remains independent.
+
+    import threading
+
+    cleanup_thread = threading.Thread(
+        target=ready_cleanup_loop,
+        daemon=True
+    )
+
+    cleanup_thread.start()
 
     main()
