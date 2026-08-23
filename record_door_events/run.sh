@@ -3,14 +3,8 @@
 set -e
 
 echo "======================================"
-echo " Record Door Events"
+echo " Record door events"
 echo "======================================"
-
-#
-# ==================================================
-# Read options
-# ==================================================
-#
 
 RTSP_URL="$(python3 -c "
 import json
@@ -30,65 +24,20 @@ with open('/data/options.json') as f:
     print(json.load(f)['segment_seconds'])
 ")"
 
-#
-# ==================================================
-# Read application version from config.yaml
-# ==================================================
-#
-
-APP_VERSION="$(python3 -c "
-import re
-
-with open('/app/config.yaml', encoding='utf-8') as f:
-    text = f.read()
-
-match = re.search(
-    r'^version:\s*[\"'\"']?([^\"'\"'\s]+)',
-    text,
-    re.MULTILINE
-)
-
-print(match.group(1) if match else 'unknown')
-")"
-
-export APP_VERSION
-
-echo "Record Door Events version: ${APP_VERSION}"
-
-#
-# ==================================================
-# Validate RTSP
-# ==================================================
-#
-
 if [ -z "$RTSP_URL" ]; then
     echo "ERROR: rtsp_url is empty!"
     exit 1
 fi
 
-#
-# ==================================================
-# Directories
-# ==================================================
-#
-
 BUFFER_DIR="/media/record-door-events/buffer"
 EVENT_DIR="/media/record-door-events/events"
 RECORD_DIR="/media/record-door-events/recordings"
 READY_DIR="/media/record-door-events/ready"
-TEMP_DIR="/media/record-door-events/tmp"
 
 mkdir -p "$BUFFER_DIR"
 mkdir -p "$EVENT_DIR"
 mkdir -p "$RECORD_DIR"
 mkdir -p "$READY_DIR"
-mkdir -p "$TEMP_DIR"
-
-#
-# ==================================================
-# Maximum buffer segments
-# ==================================================
-#
 
 MAX_SEGMENTS=$((BUFFER_SECONDS / SEGMENT_SECONDS + 10))
 
@@ -101,17 +50,15 @@ echo "Buffer directory: $BUFFER_DIR"
 echo "Event directory: $EVENT_DIR"
 echo "Recording directory: $RECORD_DIR"
 echo "Ready directory: $READY_DIR"
-echo "Temporary directory: $TEMP_DIR"
 
-#
+
 # ==================================================
 # Ring buffer cleanup
 # ==================================================
-#
 
-cleanup_buffer() {
+cleanup() {
 
-    echo "Buffer cleanup process started."
+    echo "Cleanup process started."
 
     while true; do
 
@@ -140,12 +87,6 @@ if count > max_segments:
             path.unlink()
         except FileNotFoundError:
             pass
-        except Exception as e:
-            print(
-                f"Unable to delete buffer segment "
-                f"{path}: {e}",
-                flush=True
-            )
 
 PY
 
@@ -154,21 +95,19 @@ PY
     done
 }
 
-cleanup_buffer &
+cleanup &
 
-#
+
 # ==================================================
 # Event processor
 # ==================================================
-#
 
 python3 /event_processor.py &
 
-#
+
 # ==================================================
 # FFmpeg
 # ==================================================
-#
 
 echo "Starting FFmpeg..."
 
