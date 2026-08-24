@@ -1,8 +1,10 @@
 # Record Door Events
 
-Home Assistant App for continuously recording an RTSP camera stream, maintaining a rolling video buffer, and creating event clips when a door event occurs.
+Home Assistant App for continuously recording an RTSP camera stream, maintaining a rolling video buffer, and creating video clips when a door event occurs.
 
-The application is designed to work with Home Assistant automations and can publish the path of a generated video through MQTT. The video can then be sent to Telegram or any other service supported by Home Assistant.
+The application is designed to work with Home Assistant automations. When an event occurs, it creates a video containing footage before and after the event and publishes the resulting file path through MQTT.
+
+Telegram delivery is handled by Home Assistant automation.
 
 ## Features
 
@@ -10,20 +12,20 @@ The application is designed to work with Home Assistant automations and can publ
 - Rolling video buffer
 - Configurable buffer duration
 - Configurable video segment duration
-- Capture video before an event
-- Capture video after an event
+- Configurable pre-event recording
+- Configurable post-event recording
 - Automatic event video creation
 - MQTT notification when a video is ready
-- Automatic cleanup of old files in the `ready` directory
+- Automatic cleanup of old videos
 - Supports `amd64` and `aarch64`
-- Designed to run as a Home Assistant App
-- Telegram integration is handled by Home Assistant automation
+- Runs as a Home Assistant App
+- Telegram integration through Home Assistant automation
 
 ## How it works
 
 The application continuously records the configured RTSP stream into short MPEG-TS segments.
 
-The segments are stored in a rolling buffer. Old segments are automatically removed when the configured buffer size is exceeded.
+The segments are stored in a rolling buffer. Old segments are automatically removed when the configured buffer duration is exceeded.
 
 When Home Assistant detects a door event, it creates an event marker:
 
@@ -31,11 +33,13 @@ When Home Assistant detects a door event, it creates an event marker:
 /media/record-door-events/events/event_<timestamp>.evt
 ```
 
-The application detects the event marker and creates a video containing:
+The application detects the event marker and waits for the configured post-event period.
 
-- video before the event
+It then creates a video containing:
+
+- footage before the event
 - the event itself
-- video after the event
+- footage after the event
 
 The resulting MP4 file is placed in:
 
@@ -43,13 +47,13 @@ The resulting MP4 file is placed in:
 /media/record-door-events/ready/
 ```
 
-The application then publishes the file path through MQTT:
+The application publishes the path of the generated video through MQTT:
 
 ```text
 record_door_events/video_ready
 ```
 
-Home Assistant can use this MQTT message to send the video to Telegram or another service.
+Home Assistant can then use this message to send the video to Telegram or another service.
 
 ## Requirements
 
@@ -58,7 +62,7 @@ Home Assistant can use this MQTT message to send the video to Telegram or anothe
 - An RTSP-compatible camera
 - MQTT broker available in Home Assistant
 
-The application currently supports:
+Supported architectures:
 
 - `amd64`
 - `aarch64`
@@ -75,9 +79,9 @@ After adding the repository, install **Record Door Events** from the Home Assist
 
 ## Configuration
 
-The application can be configured from the Home Assistant App configuration page.
+The application is configured from the Home Assistant App configuration page.
 
-Example configuration:
+Example:
 
 ```yaml
 rtsp_url: "rtsp://username:password@192.168.1.100:554/stream"
@@ -100,16 +104,26 @@ mqtt_password: ""
 
 | Option | Description | Default |
 |---|---|---:|
-| `rtsp_url` | RTSP camera stream URL | — |
-| `buffer_seconds` | Duration of the rolling buffer | `60` |
-| `segment_seconds` | Duration of each video segment | `1` |
-| `pre_event_seconds` | Video captured before the event | `5` |
-| `post_event_seconds` | Video captured after the event | `10` |
+| `rtsp_url` | RTSP URL of the camera stream | — |
+| `buffer_seconds` | Duration of the rolling video buffer in seconds | `60` |
+| `segment_seconds` | Duration of each video segment in seconds | `1` |
+| `pre_event_seconds` | Number of seconds recorded before the event | `5` |
+| `post_event_seconds` | Number of seconds recorded after the event | `10` |
 | `ready_retention_days` | Number of days to keep generated videos in `ready/` | `3` |
 | `mqtt_host` | MQTT broker hostname | `core-mosquitto` |
 | `mqtt_port` | MQTT broker port | `1883` |
 | `mqtt_username` | MQTT username | — |
 | `mqtt_password` | MQTT password | — |
+
+### Parameter limits
+
+| Option | Allowed range |
+|---|---:|
+| `buffer_seconds` | `30–300` |
+| `segment_seconds` | `1–2` |
+| `pre_event_seconds` | `0–60` |
+| `post_event_seconds` | `1–120` |
+| `ready_retention_days` | `1–30` |
 
 ## Home Assistant automation
 
@@ -117,7 +131,7 @@ The application does not detect the door state itself.
 
 Home Assistant is responsible for detecting the event and creating an event marker.
 
-Example `configuration.yaml`:
+Add the following to `configuration.yaml`:
 
 ```yaml
 shell_command:
@@ -127,6 +141,8 @@ shell_command:
   record_door_events_delete_video: >-
     rm -f "{{ filename }}"
 ```
+
+The `record_door_events_delete_video` command is optional and can be used by Home Assistant to manually delete a generated video.
 
 Example automation:
 
@@ -149,9 +165,9 @@ Example automation:
 
 Replace the `entity_id` with the door sensor used in your Home Assistant installation.
 
-## MQTT notification
+## MQTT
 
-When a video is successfully created, the application publishes its file path to:
+When a video has been successfully created, the application publishes an MQTT message to:
 
 ```text
 record_door_events/video_ready
@@ -159,15 +175,17 @@ record_door_events/video_ready
 
 The MQTT payload contains the full path to the generated video.
 
-Example:
+Example payload:
 
 ```text
 /media/record-door-events/ready/event_20260823_120000_a1b2c3.mp4
 ```
 
-## Telegram example
+## Telegram
 
 Telegram delivery is intentionally handled by Home Assistant rather than by the application.
+
+This keeps the application independent from Telegram and allows Home Assistant to control the destination, caption, and delivery logic.
 
 Example automation:
 
@@ -183,7 +201,7 @@ Example automation:
     - action: telegram_bot.send_video
       data:
         chat_id:
-          - 1254456
+          - 0123456
         file: "{{ trigger.payload }}"
         caption: >-
           🚪 Door opened
@@ -216,21 +234,25 @@ The application uses the following directories:
 
 Contains the rolling RTSP video buffer.
 
-Old segments are automatically removed.
+Old segments are automatically removed according to the configured buffer duration.
 
 ### `events/`
 
-Contains temporary event marker files created by Home Assistant.
+Contains event marker files created by Home Assistant.
 
 ### `recordings/`
 
-Contains generated event videos.
+Temporary storage for newly generated event videos before they are moved to `ready/`.
 
 ### `ready/`
 
-Contains generated videos waiting to be processed by Home Assistant.
+Contains generated videos that are ready for processing by Home Assistant.
 
-Files older than the configured `ready_retention_days` are automatically deleted.
+Videos are published through MQTT when they become available.
+
+After successful processing, Home Assistant can delete the video using the `record_door_events_delete_video` shell command.
+
+Files that remain in `ready/` are automatically deleted after `ready_retention_days`.
 
 The default retention period is:
 
@@ -244,9 +266,21 @@ Temporary files used while creating event videos.
 
 Temporary files are removed after processing.
 
+## Video processing
+
+The application uses FFmpeg to:
+
+1. record the RTSP stream;
+2. maintain the rolling buffer;
+3. combine the required segments;
+4. create the final MP4 event video;
+5. validate the generated video.
+
+The generated video uses H.264 video encoding and MP4 container format.
+
 ## Versioning
 
-The application version is defined in one place only:
+The application version is defined in one place:
 
 ```yaml
 version: "0.7.5"
@@ -256,18 +290,17 @@ in `config.yaml`.
 
 When releasing a new version, update this value and commit the change.
 
-GitHub Actions builds and publishes the corresponding container images automatically.
+GitHub Actions automatically builds and publishes the corresponding container images.
 
-## Architecture
-
-The application consists of four main files:
+## Project structure
 
 ```text
 record_door_events/
 ├── config.yaml
 ├── Dockerfile
 ├── event_processor.py
-└── run.sh
+├── run.sh
+└── icon.png
 ```
 
 ### `config.yaml`
@@ -276,11 +309,7 @@ Home Assistant App configuration and application version.
 
 ### `Dockerfile`
 
-Builds the application container and installs:
-
-- FFmpeg
-- Python
-- Paho MQTT
+Defines the application container and installs the required software.
 
 ### `run.sh`
 
@@ -288,7 +317,11 @@ Starts the RTSP recording process and maintains the rolling buffer.
 
 ### `event_processor.py`
 
-Processes door events, creates event videos, performs validation, manages the `ready` directory, and publishes MQTT notifications.
+Processes event markers, creates event videos, validates generated files, manages retention, and publishes MQTT notifications.
+
+### `icon.png`
+
+Application icon used by Home Assistant.
 
 ## Building
 
@@ -310,7 +343,5 @@ This project is released under the MIT License.
 See [LICENSE](LICENSE) for details.
 
 ## Repository
-
-GitHub:
 
 https://github.com/Ujimych/Record-door-events
