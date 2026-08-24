@@ -2,7 +2,16 @@ name: Record Door Events
 version: "0.7.5"
 slug: record_door_events
 
-description: "Record door events and prepare videos for sending to Telegram"
+description: >-
+  Home Assistant App for continuously recording an RTSP camera stream,
+  maintaining a rolling video buffer, and creating video clips when a
+  door event occurs.
+
+  The application is designed to work with Home Assistant automations.
+  When an event occurs, it creates a video containing footage before and
+  after the event and publishes the resulting file path through MQTT.
+
+  Telegram delivery is handled by Home Assistant automation.
 
 url: "https://github.com/Ujimych/Record-door-events"
 
