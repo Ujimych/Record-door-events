@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 echo "======================================"
 echo " Record door events"
 echo "======================================"
@@ -109,18 +107,32 @@ python3 /event_processor.py &
 # FFmpeg
 # ==================================================
 
-echo "Starting FFmpeg..."
+while true; do
 
-exec ffmpeg \
-    -hide_banner \
-    -loglevel error \
-    -rtsp_transport tcp \
-    -i "$RTSP_URL" \
-    -an \
-    -c:v copy \
-    -f segment \
-    -segment_time "$SEGMENT_SECONDS" \
-    -reset_timestamps 1 \
-    -strftime 1 \
-    -segment_format mpegts \
-    "$BUFFER_DIR/segment_%Y%m%d_%H%M%S.ts"
+    echo "Starting FFmpeg..."
+
+    # Remove incomplete zero-byte segments left by a previous FFmpeg run
+    find "$BUFFER_DIR" -name "segment_*.ts" -type f -size 0 -delete
+
+    ffmpeg \
+        -hide_banner \
+        -loglevel error \
+        -rtsp_transport tcp \
+        -i "$RTSP_URL" \
+        -an \
+        -c:v copy \
+        -f segment \
+        -segment_time "$SEGMENT_SECONDS" \
+        -reset_timestamps 1 \
+        -strftime 1 \
+        -segment_format mpegts \
+        "$BUFFER_DIR/segment_%Y%m%d_%H%M%S.ts"
+
+    EXIT_CODE=$?
+
+    echo "FFmpeg stopped. Exit code: $EXIT_CODE"
+    echo "Restarting FFmpeg in 3 seconds..."
+
+    sleep 3
+
+done
