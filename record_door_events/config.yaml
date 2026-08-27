@@ -1,5 +1,5 @@
 name: Record Door Events
-version: "0.7.5"
+version: "0.7.6"
 slug: record_door_events
 
 description: "Record door events and prepare videos for sending to Telegram"
