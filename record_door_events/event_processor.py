@@ -882,34 +882,34 @@ def process_event(event_file):
             first_segment_timestamp
         )
 
-		available_after_offset = (
-			intermediate_duration -
-			trim_offset
-		)
+        available_after_offset = (
+            intermediate_duration -
+            trim_offset
+        )
 
-		if available_after_offset <= 0:
-			log(
-				f"Event {event_file.name}: "
-				f"ERROR: no video available after "
-				f"start offset "
-				f"(intermediate={intermediate_duration:.2f}s, "
-				f"offset={trim_offset:.3f}s)"
-			)
+        if available_after_offset <= 0:
+            log(
+                f"Event {event_file.name}: "
+                f"ERROR: no video available after "
+                f"start offset "
+                f"(intermediate={intermediate_duration:.2f}s, "
+                f"offset={trim_offset:.3f}s)"
+            )
 
-			return
+            return
 
-		if available_after_offset < TARGET_DURATION:
-			log(
-				f"Event {event_file.name}: "
-				f"WARNING: only "
-				f"{available_after_offset:.2f}s "
-				f"available after start offset"
-			)
+        if available_after_offset < TARGET_DURATION:
+            log(
+                f"Event {event_file.name}: "
+                f"WARNING: only "
+                f"{available_after_offset:.2f}s "
+                f"available after start offset"
+            )
 
-		final_duration = min(
-			TARGET_DURATION,
-			available_after_offset
-		)
+        final_duration = min(
+            TARGET_DURATION,
+            available_after_offset
+        )
 
         # --------------------------------------------------
         # Final FFmpeg
