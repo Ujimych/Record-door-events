@@ -4,28 +4,11 @@ echo "======================================"
 echo " Record door events"
 echo "======================================"
 
-RTSP_URL="$(python3 -c "
-import json
-with open('/data/options.json') as f:
-    print(json.load(f)['rtsp_url'])
-")"
+RTSP_URL="$(python3 -c "import json; print(json.load(open('/data/options.json'))['rtsp_url'])")"
+BUFFER_SECONDS="$(python3 -c "import json; print(json.load(open('/data/options.json'))['buffer_seconds'])")"
+SEGMENT_SECONDS="$(python3 -c "import json; print(json.load(open('/data/options.json'))['segment_seconds'])")"
 
-BUFFER_SECONDS="$(python3 -c "
-import json
-with open('/data/options.json') as f:
-    print(json.load(f)['buffer_seconds'])
-")"
-
-SEGMENT_SECONDS="$(python3 -c "
-import json
-with open('/data/options.json') as f:
-    print(json.load(f)['segment_seconds'])
-")"
-
-if [ -z "$RTSP_URL" ]; then
-    echo "ERROR: rtsp_url is empty!"
-    exit 1
-fi
+if [ -z "$RTSP_URL" ]; then echo "ERROR: rtsp_url is empty!"; exit 1; fi
 
 BUFFER_DIR="/media/record-door-events/buffer"
 EVENT_DIR="/media/record-door-events/events"
@@ -49,52 +32,26 @@ echo "Event directory: $EVENT_DIR"
 echo "Recording directory: $RECORD_DIR"
 echo "Ready directory: $READY_DIR"
 
-
 # ==================================================
 # Ring buffer cleanup
 # ==================================================
-
 cleanup() {
-
     echo "Cleanup process started."
-
     while true; do
-
         python3 - "$BUFFER_DIR" "$MAX_SEGMENTS" <<'PY'
-
-import sys
-from pathlib import Path
-
-buffer_dir = Path(sys.argv[1])
-max_segments = int(sys.argv[2])
-
-files = sorted(
-    buffer_dir.glob("segment_*.ts"),
-    key=lambda p: p.name
-)
-
-count = len(files)
-
-if count > max_segments:
-
-    delete_count = count - max_segments
-
-    for path in files[:delete_count]:
-
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
+import sys; from pathlib import Path
+buffer_dir, max_segments = Path(sys.argv[1]), int(sys.argv[2])
+files = sorted(buffer_dir.glob("segment_*.ts"), key=lambda p: p.name)
+if len(files) > max_segments:
+    for path in files[:len(files) - max_segments]:
+        try: path.unlink()
+        except FileNotFoundError: pass
 PY
-
         sleep 2
-
     done
 }
 
 cleanup &
-
 
 # ==================================================
 # Event processor
@@ -102,13 +59,11 @@ cleanup &
 
 python3 /event_processor.py &
 
-
 # ==================================================
 # FFmpeg
 # ==================================================
 
 while true; do
-
     echo "Starting FFmpeg..."
 
     # Remove incomplete zero-byte segments left by a previous FFmpeg run
@@ -133,5 +88,4 @@ while true; do
     echo "Restarting FFmpeg in 3 seconds..."
 
     sleep 3
-
 done
