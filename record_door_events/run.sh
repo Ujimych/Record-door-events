@@ -27,10 +27,10 @@ MAX_SEGMENTS=$((BUFFER_SECONDS / SEGMENT_SECONDS + 10))
 STARTUP_GRACE=30
 
 echo "RTSP: configured"
-echo "RTSP transport: ${RTSP_TRANSPORT}"
+echo "RTSP transport: $RTSP_TRANSPORT"
 echo "Buffer: ${BUFFER_SECONDS}s"
 echo "Segment: ${SEGMENT_SECONDS}s"
-echo "Maximum segments: ${MAX_SEGMENTS}"
+echo "Maximum segments: $MAX_SEGMENTS"
 echo "Watchdog timeout: ${WATCHDOG_TIMEOUT}s"
 
 cleanup() {
@@ -40,16 +40,15 @@ cleanup() {
 import sys
 from pathlib import Path
 
-buffer_dir = Path(sys.argv[1])
-max_segments = int(sys.argv[2])
-files = sorted(buffer_dir.glob("segment_*.ts"), key=lambda p: p.name)
+directory = Path(sys.argv[1])
+limit = int(sys.argv[2])
+files = sorted(directory.glob("segment_*.ts"), key=lambda p: p.name)
 
-if len(files) > max_segments:
-    for path in files[:len(files) - max_segments]:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+for path in files[:-limit]:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 PY
         sleep 2
     done
@@ -84,10 +83,20 @@ while true; do
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
         sleep 5
 
+        NEWEST_SEGMENT=$(python3 - "$BUFFER_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+files = [p for p in Path(sys.argv[1]).glob("segment_*.ts") if p.is_file() and p.stat().st_size > 0]
+
+if files:
+    path = max(files, key=lambda p: p.stat().st_mtime)
+    print(f"{path.stat().st_mtime} {path}")
+PY
+)
+
         NOW=$(date +%s)
         UPTIME=$((NOW - START_TIME))
-
-        NEWEST_SEGMENT=$(find "$BUFFER_DIR" -name "segment_*.ts" -type f -size +0c -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)
 
         if [ -z "$NEWEST_SEGMENT" ]; then
             if [ "$UPTIME" -gt "$STARTUP_GRACE" ]; then
