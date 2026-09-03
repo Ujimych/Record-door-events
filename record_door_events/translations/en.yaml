@@ -1,0 +1,48 @@
+configuration:
+  rtsp_url:
+    name: RTSP URL
+    description: RTSP URL of the camera stream.
+
+  rtsp_transport:
+    name: RTSP transport
+    description: Transport protocol used for the RTSP stream.
+
+  buffer_seconds:
+    name: Rolling buffer duration
+    description: Duration of the rolling video buffer in seconds.
+
+  segment_seconds:
+    name: Segment duration
+    description: Duration of each video segment in seconds.
+
+  pre_event_seconds:
+    name: Pre-event recording
+    description: Number of seconds of video to include before the event.
+
+  post_event_seconds:
+    name: Post-event recording
+    description: Number of seconds of video to include after the event.
+
+  ready_retention_days:
+    name: Video retention
+    description: Number of days to keep generated videos.
+
+  watchdog_timeout:
+    name: Watchdog timeout
+    description: Restart FFmpeg if no new video segment appears within this time.
+
+  mqtt_host:
+    name: MQTT host
+    description: MQTT broker hostname.
+
+  mqtt_port:
+    name: MQTT port
+    description: MQTT broker port.
+
+  mqtt_username:
+    name: MQTT username
+    description: MQTT broker username.
+
+  mqtt_password:
+    name: MQTT password
+    description: MQTT broker password.
