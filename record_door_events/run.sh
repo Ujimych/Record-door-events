@@ -4,9 +4,12 @@ echo "======================================"
 echo " Record door events"
 echo "======================================"
 
-RTSP_URL="$(python3 -c "import json; print(json.load(open('/data/options.json'))['rtsp_url'])")"
-BUFFER_SECONDS="$(python3 -c "import json; print(json.load(open('/data/options.json'))['buffer_seconds'])")"
-SEGMENT_SECONDS="$(python3 -c "import json; print(json.load(open('/data/options.json'))['segment_seconds'])")"
+OPTIONS="/data/options.json"
+RTSP_URL="$(python3 -c "import json; print(json.load(open('$OPTIONS'))['rtsp_url'])")"
+RTSP_TRANSPORT="$(python3 -c "import json; print(json.load(open('$OPTIONS')).get('rtsp_transport', 'tcp'))")"
+BUFFER_SECONDS="$(python3 -c "import json; print(json.load(open('$OPTIONS'))['buffer_seconds'])")"
+SEGMENT_SECONDS="$(python3 -c "import json; print(json.load(open('$OPTIONS'))['segment_seconds'])")"
+WATCHDOG_TIMEOUT="$(python3 -c "import json; print(json.load(open('$OPTIONS')).get('watchdog_timeout', 20))")"
 
 if [ -z "$RTSP_URL" ]; then
     echo "ERROR: rtsp_url is empty!"
@@ -21,10 +24,10 @@ READY_DIR="/media/record-door-events/ready"
 mkdir -p "$BUFFER_DIR" "$EVENT_DIR" "$RECORD_DIR" "$READY_DIR"
 
 MAX_SEGMENTS=$((BUFFER_SECONDS / SEGMENT_SECONDS + 10))
-WATCHDOG_TIMEOUT=20
 STARTUP_GRACE=30
 
 echo "RTSP: configured"
+echo "RTSP transport: ${RTSP_TRANSPORT}"
 echo "Buffer: ${BUFFER_SECONDS}s"
 echo "Segment: ${SEGMENT_SECONDS}s"
 echo "Maximum segments: ${MAX_SEGMENTS}"
@@ -53,7 +56,6 @@ PY
 }
 
 cleanup &
-
 python3 /event_processor.py &
 
 while true; do
@@ -64,7 +66,7 @@ while true; do
     ffmpeg \
         -hide_banner \
         -loglevel error \
-        -rtsp_transport tcp \
+        -rtsp_transport "$RTSP_TRANSPORT" \
         -i "$RTSP_URL" \
         -an \
         -c:v copy \
@@ -96,6 +98,8 @@ while true; do
                 if kill -0 "$FFMPEG_PID" 2>/dev/null; then
                     kill -9 "$FFMPEG_PID" 2>/dev/null
                 fi
+
+                break
             fi
             continue
         fi
