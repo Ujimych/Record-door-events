@@ -1,14 +1,11 @@
 name: Record Door Events
 version: "0.8.0"
 slug: record_door_events
-
 description: "Record door events and prepare videos for sending to Telegram"
-
 url: "https://github.com/Ujimych/Record-door-events"
 
 startup: application
 boot: auto
-
 init: false
 
 arch:
@@ -16,67 +13,31 @@ arch:
   - aarch64
 
 options:
-
-  # RTSP URL of the camera stream
   rtsp_url: ""
-
-  # Duration of the rolling video buffer in seconds
+  rtsp_transport: "tcp"
   buffer_seconds: 60
-
-  # Duration of each video segment in seconds
   segment_seconds: 1
-
-  # Number of seconds of video to include before the event
   pre_event_seconds: 5
-
-  # Number of seconds of video to include after the event
   post_event_seconds: 10
-
-  # Number of days to keep generated videos in the ready directory
   ready_retention_days: 3
-
-  # MQTT broker hostname
+  watchdog_timeout: 20
   mqtt_host: "core-mosquitto"
-
-  # MQTT broker port
   mqtt_port: 1883
-
-  # MQTT username
   mqtt_username: ""
-
-  # MQTT password
   mqtt_password: ""
 
 schema:
-
-  # RTSP URL of the camera stream
   rtsp_url: str
-
-  # Duration of the rolling video buffer in seconds
+  rtsp_transport: list(tcp|udp)
   buffer_seconds: int(30,300)
-
-  # Duration of each video segment in seconds
   segment_seconds: int(1,2)
-
-  # Number of seconds of video to include before the event
   pre_event_seconds: int(0,60)
-
-  # Number of seconds of video to include after the event
   post_event_seconds: int(1,120)
-
-  # Number of days to keep generated videos in the ready directory
   ready_retention_days: int(1,30)
-
-  # MQTT broker hostname
+  watchdog_timeout: int(10,120)
   mqtt_host: str
-
-  # MQTT broker port
   mqtt_port: int
-
-  # MQTT username
   mqtt_username: str
-
-  # MQTT password
   mqtt_password: password
 
 map:
