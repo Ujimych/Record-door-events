@@ -1,1461 +1,355 @@
-#!/usr/bin/env python3
-
 import json
-import time
-import uuid
-import shutil
+import logging
+import os
 import subprocess
-
-from pathlib import Path
-from datetime import datetime
+import time
 from concurrent.futures import ThreadPoolExecutor
-
-import paho.mqtt.client as mqtt
-
-
-# ==================================================
-# Paths
-# ==================================================
+from datetime import datetime
+from pathlib import Path
 
 BUFFER_DIR = Path("/media/record-door-events/buffer")
 EVENT_DIR = Path("/media/record-door-events/events")
 RECORD_DIR = Path("/media/record-door-events/recordings")
 READY_DIR = Path("/media/record-door-events/ready")
 TEMP_DIR = Path("/media/record-door-events/tmp")
-
 OPTIONS_FILE = Path("/data/options.json")
-
-
-# ==================================================
-# Logging
-# ==================================================
-
-def log(message):
-    print(
-        f"[event-processor] {message}",
-        flush=True
-    )
-
-
-# ==================================================
-# Options
-# ==================================================
-
-try:
-    with OPTIONS_FILE.open(
-        "r",
-        encoding="utf-8"
-    ) as f:
-        OPTIONS = json.load(f)
-
-except Exception as e:
-    log(
-        f"ERROR: unable to read "
-        f"{OPTIONS_FILE}: {e}"
-    )
-
-    OPTIONS = {}
-
-
-# ==================================================
-# Recording parameters
-# ==================================================
-
-PRE_EVENT = float(
-    OPTIONS.get(
-        "pre_event_seconds",
-        5
-    )
-)
-
-POST_EVENT = float(
-    OPTIONS.get(
-        "post_event_seconds",
-        10
-    )
-)
-
-SEGMENT_SECONDS = float(
-    OPTIONS.get(
-        "segment_seconds",
-        1
-    )
-)
-
-TARGET_DURATION = (
-    PRE_EVENT +
-    POST_EVENT
-)
-
-MAX_WORKERS = 10
-
-
-# ==================================================
-# MQTT
-# ==================================================
 
 MQTT_TOPIC = "record_door_events/video_ready"
 
-mqtt_client = None
+PRE_EVENT = 5.0
+POST_EVENT = 10.0
+TARGET_DURATION = 15.0
+STALE_BUFFER_SECONDS = 120
+RETRY_DELAY = 5
+MAX_WORKERS = 10
+
+VIDEO_BITRATE = "2M"
+VIDEO_MAXRATE = "2M"
+VIDEO_BUFSIZE = "4M"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("event_processor")
+
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+RECORD_DIR.mkdir(parents=True, exist_ok=True)
+READY_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ==================================================
-# Ready retention
-# ==================================================
-
-READY_RETENTION_DAYS = int(
-    OPTIONS.get(
-        "ready_retention_days",
-        3
-    )
-)
-
-READY_RETENTION_SECONDS = (
-    READY_RETENTION_DAYS *
-    24 *
-    60 *
-    60
-)
+def load_options():
+    try:
+        with OPTIONS_FILE.open() as f:
+            return json.load(f)
+    except Exception as e:
+        log.error("Cannot read options: %s", e)
+        return {}
 
 
-# ==================================================
-# MQTT options
-# ==================================================
-
-MQTT_HOST = OPTIONS.get(
-    "mqtt_host",
-    "core-mosquitto"
-)
-
-MQTT_PORT = int(
-    OPTIONS.get(
-        "mqtt_port",
-        1883
-    )
-)
-
-MQTT_USERNAME = OPTIONS.get(
-    "mqtt_username",
-    ""
-)
-
-MQTT_PASSWORD = OPTIONS.get(
-    "mqtt_password",
-    ""
-)
+OPTIONS = load_options()
+SEGMENT_SECONDS = float(OPTIONS.get("segment_seconds", 1))
+BUFFER_SECONDS = float(OPTIONS.get("buffer_seconds", 60))
+MQTT_HOST = OPTIONS.get("mqtt_host", "core-mosquitto")
+MQTT_PORT = int(OPTIONS.get("mqtt_port", 1883))
+MQTT_USER = OPTIONS.get("mqtt_username", "")
+MQTT_PASSWORD = OPTIONS.get("mqtt_password", "")
 
 
-# ==================================================
-# MQTT
-# ==================================================
+def parse_event_time(path):
+    try:
+        return float(path.stem.replace("event_", ""))
+    except Exception:
+        return None
 
-def mqtt_connect():
-    global mqtt_client
+
+def segment_time(path):
+    try:
+        return datetime.strptime(path.stem.replace("segment_", ""), "%Y%m%d_%H%M%S").timestamp()
+    except Exception:
+        return None
+
+
+def get_segments():
+    result = []
+    for path in BUFFER_DIR.glob("segment_*.ts"):
+        ts = segment_time(path)
+        if ts is not None and path.exists() and path.stat().st_size > 0:
+            result.append((ts, path))
+    return sorted(result)
+
+
+def delete_event_marker(event_file):
+    try:
+        event_file.unlink()
+        log.info("Event marker removed: %s", event_file.name)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.error("Cannot remove event marker %s: %s", event_file, e)
+
+
+def run_ffmpeg(command):
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            log.error("FFmpeg failed: %s", result.stderr.strip())
+            return False
+        return True
+    except Exception as e:
+        log.error("FFmpeg exception: %s", e)
+        return False
+
+
+def wait_for_segments(end_time):
+    while time.time() < end_time:
+        segments = get_segments()
+        if segments:
+            newest = segments[-1][0]
+            if newest >= end_time - SEGMENT_SECONDS:
+                return segments
+        time.sleep(1)
+    return get_segments()
+
+
+def publish_mqtt(video_file):
+    try:
+        import paho.mqtt.publish as publish
+
+        kwargs = {
+            "hostname": MQTT_HOST,
+            "port": MQTT_PORT,
+            "topic": MQTT_TOPIC,
+            "payload": str(video_file)
+        }
+
+        if MQTT_USER:
+            kwargs["auth"] = {"username": MQTT_USER, "password": MQTT_PASSWORD}
+
+        publish.single(**kwargs)
+        log.info("MQTT published: %s", video_file)
+        return True
+    except Exception as e:
+        log.error("MQTT publish failed: %s", e)
+        return False
+
+
+def validate_video(path):
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ]
 
     try:
-        mqtt_client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id="record-door-events"
-        )
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error("Validation failed: %s", result.stderr.strip())
+            return False
 
-        if MQTT_USERNAME:
-            mqtt_client.username_pw_set(
-                MQTT_USERNAME,
-                MQTT_PASSWORD
-            )
+        duration = float(result.stdout.strip())
+        log.info("Validated: %.2fs, %.1f MB", duration, path.stat().st_size / 1024 / 1024)
+        return duration > 0
+    except Exception as e:
+        log.error("Validation exception: %s", e)
+        return False
 
-        mqtt_client.connect(
-            MQTT_HOST,
-            MQTT_PORT,
-            60
-        )
 
-        mqtt_client.loop_start()
+def process_event(event_file):
+    event_time = parse_event_time(event_file)
+    if event_time is None:
+        log.error("Invalid event filename: %s", event_file.name)
+        delete_event_marker(event_file)
+        return True
 
-        log(
-            f"MQTT connected: "
-            f"{MQTT_HOST}:{MQTT_PORT}"
-        )
+    now = time.time()
 
+    if now - event_time > BUFFER_SECONDS + POST_EVENT + 30:
+        log.error("Event is too old for current buffer: %s", event_file.name)
+        delete_event_marker(event_file)
+        return True
+
+    start_time = event_time - PRE_EVENT
+    end_time = event_time + POST_EVENT
+
+    if now < end_time:
+        time.sleep(end_time - now + 1)
+
+    segments = get_segments()
+
+    if not segments:
+        log.warning("No buffer segments available")
+        return False
+
+    newest_time = segments[-1][0]
+    age = time.time() - newest_time
+
+    if age > STALE_BUFFER_SECONDS:
+        log.warning("Buffer is stale; newest segment is %.1fs old: %s", age, datetime.fromtimestamp(newest_time))
+        return False
+
+    selected = [(ts, path) for ts, path in segments if ts <= end_time and ts + SEGMENT_SECONDS >= start_time]
+
+    if not selected:
+        log.warning("No suitable segments for event %s", event_file.name)
+        return False
+
+    selected = sorted(selected)
+
+    log.info("Event %s: selected %d segment(s)", event_file.name, len(selected))
+    for _, path in selected:
+        log.info("  %s", path.name)
+
+    stamp = datetime.fromtimestamp(event_time).strftime("%Y%m%d_%H%M%S")
+    base = f"event_{stamp}_{int(event_time * 1000) % 1000:03d}"
+
+    work_dir = TEMP_DIR / base
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    combined = work_dir / "combined.mp4"
+    normalized = work_dir / "normalized.mp4"
+    output_file = READY_DIR / f"{base}.mp4"
+
+    try:
+        copied = []
+
+        for index, (_, source) in enumerate(selected):
+            destination = work_dir / f"segment_{index:04d}.ts"
+
+            try:
+                with source.open("rb") as src, destination.open("wb") as dst:
+                    while True:
+                        data = src.read(1024 * 1024)
+                        if not data:
+                            break
+                        dst.write(data)
+                copied.append(destination)
+            except Exception as e:
+                log.error("Cannot copy %s: %s", source, e)
+                return False
+
+        concat_file = work_dir / "concat.txt"
+        with concat_file.open("w") as f:
+            for path in copied:
+                f.write(f"file '{path.name}'\n")
+
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror",
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-c", "copy", "-movflags", "+faststart", "-y", str(combined)
+        ]
+
+        if not run_ffmpeg(command):
+            return False
+
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror",
+            "-i", str(combined),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-b:v", VIDEO_BITRATE,
+            "-maxrate", VIDEO_MAXRATE,
+            "-bufsize", VIDEO_BUFSIZE,
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-movflags", "+faststart",
+            "-y", str(normalized)
+        ]
+
+        if not run_ffmpeg(command):
+            return False
+
+        first_segment_time = selected[0][0]
+        trim_offset = max(0.0, start_time - first_segment_time)
+
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror",
+            "-i", str(normalized),
+            "-ss", f"{trim_offset:.3f}",
+            "-t", f"{TARGET_DURATION:.3f}",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-b:v", VIDEO_BITRATE,
+            "-maxrate", VIDEO_MAXRATE,
+            "-bufsize", VIDEO_BUFSIZE,
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            "-y", str(output_file)
+        ]
+
+        if not run_ffmpeg(command):
+            return False
+
+        if not validate_video(output_file):
+            try:
+                output_file.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+
+        if not publish_mqtt(output_file):
+            return False
+
+        log.info("RECORDING READY: %s", output_file)
+        delete_event_marker(event_file)
         return True
 
     except Exception as e:
-        log(
-            f"MQTT connection failed: {e}"
-        )
-
-        mqtt_client = None
-
+        log.exception("Event processing failed: %s", e)
         return False
-
-
-# ==================================================
-# Cleanup ready directory
-# ==================================================
-
-def cleanup_ready_directory():
-    try:
-        if not READY_DIR.exists():
-            return
-
-        now = time.time()
-
-        deleted = 0
-
-        for video_file in READY_DIR.iterdir():
-
-            if not video_file.is_file():
-                continue
-
-            try:
-                age = (
-                    now -
-                    video_file.stat().st_mtime
-                )
-
-            except FileNotFoundError:
-                continue
-
-            if age > READY_RETENTION_SECONDS:
-
-                try:
-                    video_file.unlink()
-
-                    deleted += 1
-
-                    log(
-                        f"Deleted old ready video: "
-                        f"{video_file.name}"
-                    )
-
-                except FileNotFoundError:
-                    pass
-
-                except Exception as e:
-                    log(
-                        f"Unable to delete old "
-                        f"ready video "
-                        f"{video_file.name}: {e}"
-                    )
-
-        if deleted:
-
-            log(
-                f"Ready cleanup: "
-                f"deleted {deleted} file(s)"
-            )
-
-    except Exception as e:
-
-        log(
-            f"Ready cleanup error: {e}"
-        )
-
-
-# ==================================================
-# Buffer
-# ==================================================
-
-def get_segments():
-    return sorted(
-        BUFFER_DIR.glob("segment_*.ts"),
-        key=lambda p: p.name
-    )
-
-
-def get_segment_timestamp(segment):
-
-    try:
-
-        timestamp_string = (
-            segment.stem.replace(
-                "segment_",
-                ""
-            )
-        )
-
-        return datetime.strptime(
-            timestamp_string,
-            "%Y%m%d_%H%M%S"
-        ).timestamp()
-
-    except Exception:
-
-        return None
-
-
-# ==================================================
-# Event marker
-# ==================================================
-
-def delete_event_marker(event_file):
-
-    try:
-
-        event_file.unlink()
-
-        log(
-            f"Event marker removed: "
-            f"{event_file.name}"
-        )
-
-    except FileNotFoundError:
-
-        pass
-
-    except Exception as e:
-
-        log(
-            f"Unable to remove event marker "
-            f"{event_file.name}: {e}"
-        )
-
-
-# ==================================================
-# Wait for segment to become stable
-# ==================================================
-
-def wait_for_segment(
-    segment,
-    timeout=5.0
-):
-
-    deadline = (
-        time.time() +
-        timeout
-    )
-
-    last_size = -1
-    stable_count = 0
-
-    while time.time() < deadline:
-
-        if not segment.exists():
-
-            time.sleep(0.2)
-            continue
-
-        try:
-
-            size = segment.stat().st_size
-
-        except FileNotFoundError:
-
-            time.sleep(0.2)
-            continue
-
-        if (
-            size > 0 and
-            size == last_size
-        ):
-
-            stable_count += 1
-
-        else:
-
-            stable_count = 0
-
-        last_size = size
-
-        if stable_count >= 2:
-
-            return True
-
-        time.sleep(0.2)
-
-    try:
-
-        return (
-            segment.exists()
-            and
-            segment.stat().st_size > 0
-        )
-
-    except FileNotFoundError:
-
-        return False
-
-
-# ==================================================
-# Probe video duration
-# ==================================================
-
-def get_video_duration(video_file):
-
-    command = [
-
-        "ffprobe",
-
-        "-v",
-        "error",
-
-        "-show_entries",
-        "format=duration",
-
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-
-        str(video_file)
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    if result.returncode != 0:
-
-        return None
-
-    try:
-
-        return float(
-            result.stdout.strip()
-        )
-
-    except Exception:
-
-        return None
-
-
-# ==================================================
-# Validate video
-# ==================================================
-
-def validate_video(video_file):
-
-    if not video_file.exists():
-
-        return False
-
-    try:
-
-        size = video_file.stat().st_size
-
-    except Exception:
-
-        return False
-
-    if size < 10000:
-
-        log(
-            f"Video validation failed: "
-            f"file too small ({size} bytes)"
-        )
-
-        return False
-
-    duration = get_video_duration(
-        video_file
-    )
-
-    if duration is None:
-
-        log(
-            "Video validation failed: "
-            "duration unavailable"
-        )
-
-        return False
-
-    log(
-        f"Video validated: "
-        f"{video_file.name}, "
-        f"duration={duration:.2f}s"
-    )
-
-    if duration < 5.0:
-
-        log(
-            f"Video validation failed: "
-            f"duration only {duration:.2f}s"
-        )
-
-        return False
-
-    return True
-
-
-# ==================================================
-# Join TS segments
-# ==================================================
-
-def join_ts_segments(
-    segments,
-    output_file
-):
-
-    try:
-
-        with output_file.open(
-            "wb"
-        ) as output:
-
-            for segment in segments:
-
-                with segment.open(
-                    "rb"
-                ) as source:
-
-                    shutil.copyfileobj(
-                        source,
-                        output
-                    )
-
-        return (
-            output_file.exists()
-            and
-            output_file.stat().st_size > 0
-        )
-
-    except Exception as e:
-
-        log(
-            f"ERROR joining TS segments: {e}"
-        )
-
-        return False
-
-
-# ==================================================
-# Process event
-# ==================================================
-
-def process_event(event_file):
-
-    temp_event_dir = None
-
-    try:
-
-        # --------------------------------------------------
-        # Event timestamp
-        # --------------------------------------------------
-
-        try:
-
-            event_timestamp = float(
-                event_file.stem.replace(
-                    "event_",
-                    ""
-                )
-            )
-
-        except Exception as e:
-
-            log(
-                f"Invalid event file "
-                f"{event_file}: {e}"
-            )
-
-            return
-
-        log(
-            f"EVENT START: "
-            f"{datetime.fromtimestamp(event_timestamp)}"
-        )
-
-        # --------------------------------------------------
-        # Wait until +POST_EVENT
-        # --------------------------------------------------
-
-        target_time = (
-            event_timestamp +
-            POST_EVENT
-        )
-
-        wait_time = (
-            target_time -
-            time.time()
-        )
-
-        if wait_time > 0:
-
-            log(
-                f"Event {event_file.name}: "
-                f"waiting {wait_time:.1f}s"
-            )
-
-            time.sleep(
-                wait_time
-            )
-
-        # Give FFmpeg time to close
-        # the last required segment.
-
-        time.sleep(2.0)
-
-        # --------------------------------------------------
-        # Requested interval
-        # --------------------------------------------------
-
-        start_time = (
-            event_timestamp -
-            PRE_EVENT
-        )
-
-        end_time = (
-            event_timestamp +
-            POST_EVENT
-        )
-
-        log(
-            f"Event {event_file.name}: "
-            f"interval "
-            f"{datetime.fromtimestamp(start_time)}"
-            f" -> "
-            f"{datetime.fromtimestamp(end_time)}"
-        )
-
-        # --------------------------------------------------
-        # Get buffer segments
-        # --------------------------------------------------
-
-        all_segments = get_segments()
-
-        if not all_segments:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: buffer is empty"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Check buffer freshness
-        # --------------------------------------------------
-
-        newest_timestamp = None
-
-        for segment in reversed(all_segments):
-
-            timestamp = get_segment_timestamp(
-                segment
-            )
-
-            if timestamp is not None:
-
-                newest_timestamp = timestamp
-                break
-
-        if newest_timestamp is None:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: unable to determine "
-                f"newest buffer timestamp"
-            )
-
-            return
-
-        newest_segment_end = (
-            newest_timestamp +
-            SEGMENT_SECONDS
-        )
-
-        buffer_age = (
-            time.time() -
-            newest_segment_end
-        )
-
-        # Allow a few seconds because the
-        # currently written segment may not yet
-        # be visible as a completed file.
-
-        max_buffer_age = max(
-            10.0,
-            SEGMENT_SECONDS * 5
-        )
-
-        if buffer_age > max_buffer_age:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: buffer is stale; "
-                f"newest segment is "
-                f"{buffer_age:.1f}s old: "
-                f"{datetime.fromtimestamp(newest_timestamp)}"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Select overlapping segments
-        # --------------------------------------------------
-
-        selected = []
-
-        for segment in all_segments:
-
-            segment_start = (
-                get_segment_timestamp(
-                    segment
-                )
-            )
-
-            if segment_start is None:
-
-                continue
-
-            segment_end = (
-                segment_start +
-                SEGMENT_SECONDS
-            )
-
-            # Segment overlaps requested interval.
-
-            if (
-                segment_end >= start_time
-                and
-                segment_start <= end_time
-            ):
-
-                selected.append(
-                    segment
-                )
-
-        selected.sort(
-            key=lambda p: (
-                get_segment_timestamp(p)
-                if get_segment_timestamp(p) is not None
-                else 0
-            )
-        )
-
-        if not selected:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: required segments "
-                f"not found"
-            )
-
-            return
-
-        log(
-            f"Event {event_file.name}: "
-            f"selected {len(selected)} segments"
-        )
-
-        # --------------------------------------------------
-        # Check time coverage
-        # --------------------------------------------------
-
-        first_timestamp = (
-            get_segment_timestamp(
-                selected[0]
-            )
-        )
-
-        last_timestamp = (
-            get_segment_timestamp(
-                selected[-1]
-            )
-        )
-
-        if (
-            first_timestamp is None
-            or
-            last_timestamp is None
-        ):
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: invalid segment timestamps"
-            )
-
-            return
-
-        available_start = first_timestamp
-
-        available_end = (
-            last_timestamp +
-            SEGMENT_SECONDS
-        )
-
-        if available_start > start_time:
-
-            log(
-                f"Event {event_file.name}: "
-                f"WARNING: missing video before "
-                f"event interval "
-                f"({available_start - start_time:.2f}s)"
-            )
-
-        if available_end < end_time:
-
-            log(
-                f"Event {event_file.name}: "
-                f"WARNING: missing video after "
-                f"event interval "
-                f"({end_time - available_end:.2f}s)"
-            )
-
-        # --------------------------------------------------
-        # Wait for selected files
-        # --------------------------------------------------
-
-        stable_segments = []
-
-        for segment in selected:
-
-            if wait_for_segment(
-                segment,
-                timeout=5.0
-            ):
-
-                stable_segments.append(
-                    segment
-                )
-
-            else:
-
-                log(
-                    f"Event {event_file.name}: "
-                    f"WARNING: segment not ready: "
-                    f"{segment.name}"
-                )
-
-        if not stable_segments:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: no stable segments"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Temporary directory
-        # --------------------------------------------------
-
-        TEMP_DIR.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        temp_event_dir = (
-            TEMP_DIR /
-            f"event_{uuid.uuid4().hex}"
-        )
-
-        temp_event_dir.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        # --------------------------------------------------
-        # Copy segments
-        # --------------------------------------------------
-
-        local_segments = []
-
-        for segment in stable_segments:
-
-            if not segment.exists():
-
-                log(
-                    f"Event {event_file.name}: "
-                    f"segment disappeared: "
-                    f"{segment.name}"
-                )
-
-                continue
-
-            local_segment = (
-                temp_event_dir /
-                segment.name
-            )
-
-            try:
-
-                shutil.copyfile(
-                    segment,
-                    local_segment
-                )
-
-            except Exception as e:
-
-                log(
-                    f"Event {event_file.name}: "
-                    f"ERROR copying "
-                    f"{segment.name}: {e}"
-                )
-
-                continue
-
-            try:
-
-                size = (
-                    local_segment.stat().st_size
-                )
-
-            except Exception:
-
-                size = 0
-
-            if size <= 0:
-
-                log(
-                    f"Event {event_file.name}: "
-                    f"ERROR: empty segment: "
-                    f"{segment.name}"
-                )
-
-                continue
-
-            local_segments.append(
-                local_segment
-            )
-
-        log(
-            f"Event {event_file.name}: "
-            f"copied {len(local_segments)} "
-            f"segments to temporary storage"
-        )
-
-        if not local_segments:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: no usable segments"
-            )
-
-            return
-
-        for segment in local_segments:
-
-            log(
-                f"Using segment: "
-                f"{segment.name}"
-            )
-
-        # --------------------------------------------------
-        # Join TS files
-        # --------------------------------------------------
-
-        combined_file = (
-            temp_event_dir /
-            "combined.ts"
-        )
-
-        log(
-            f"Event {event_file.name}: "
-            f"joining segments"
-        )
-
-        if not join_ts_segments(
-            local_segments,
-            combined_file
-        ):
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: unable to join segments"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Create normalized intermediate MP4
-        # --------------------------------------------------
-
-        intermediate_file = (
-            temp_event_dir /
-            "intermediate.mp4"
-        )
-
-        normalize_command = [
-
-            "ffmpeg",
-
-            "-hide_banner",
-
-            "-loglevel",
-            "error",
-
-            "-fflags",
-            "+genpts+discardcorrupt",
-
-            "-i",
-            str(combined_file),
-
-            "-an",
-
-            "-vf",
-            "setpts=PTS-STARTPTS",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "22",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            "-avoid_negative_ts",
-            "make_zero",
-
-            "-movflags",
-            "+faststart",
-
-            "-y",
-
-            str(intermediate_file)
-        ]
-
-        log(
-            f"Event {event_file.name}: "
-            f"normalizing video"
-        )
-
-        result = subprocess.run(
-            normalize_command
-        )
-
-        if result.returncode != 0:
-
-            log(
-                f"Event {event_file.name}: "
-                f"FFmpeg normalization ERROR: "
-                f"exit code {result.returncode}"
-            )
-
-            return
-
-        if not intermediate_file.exists():
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: intermediate file "
-                f"was not created"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Determine duration
-        # --------------------------------------------------
-
-        intermediate_duration = (
-            get_video_duration(
-                intermediate_file
-            )
-        )
-
-        if intermediate_duration is None:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: unable to determine "
-                f"intermediate duration"
-            )
-
-            return
-
-        log(
-            f"Intermediate duration: "
-            f"{intermediate_duration:.2f}s"
-        )
-
-        # --------------------------------------------------
-        # Calculate trim offset
-        # --------------------------------------------------
-
-        first_segment_timestamp = (
-            get_segment_timestamp(
-                stable_segments[0]
-            )
-        )
-
-        if first_segment_timestamp is None:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: invalid first segment timestamp"
-            )
-
-            return
-
-        trim_offset = max(
-            0.0,
-            start_time -
-            first_segment_timestamp
-        )
-
-        available_after_offset = (
-            intermediate_duration -
-            trim_offset
-        )
-
-        if available_after_offset <= 0:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: no video available after "
-                f"start offset "
-                f"(intermediate={intermediate_duration:.2f}s, "
-                f"offset={trim_offset:.3f}s)"
-            )
-
-            return
-
-        if available_after_offset < TARGET_DURATION:
-
-            log(
-                f"Event {event_file.name}: "
-                f"WARNING: only "
-                f"{available_after_offset:.2f}s "
-                f"available after start offset"
-            )
-
-        final_duration = min(
-            TARGET_DURATION,
-            available_after_offset
-        )
-
-        if final_duration < 5.0:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: resulting duration would "
-                f"be too short: "
-                f"{final_duration:.2f}s"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Output filename
-        # --------------------------------------------------
-
-        timestamp = datetime.fromtimestamp(
-            event_timestamp
-        )
-
-        output_file = (
-            RECORD_DIR /
-            (
-                "event_"
-                +
-                timestamp.strftime(
-                    "%Y%m%d_%H%M%S"
-                )
-                +
-                "_"
-                +
-                uuid.uuid4().hex[:6]
-                +
-                ".mp4"
-            )
-        )
-
-        # --------------------------------------------------
-        # Final trim
-        # --------------------------------------------------
-
-        final_command = [
-
-            "ffmpeg",
-
-            "-hide_banner",
-
-            "-loglevel",
-            "error",
-
-            "-i",
-            str(intermediate_file),
-
-            "-ss",
-            f"{trim_offset:.3f}",
-
-            "-t",
-            f"{final_duration:.3f}",
-
-            "-an",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "22",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            "-movflags",
-            "+faststart",
-
-            "-y",
-
-            str(output_file)
-        ]
-
-        log(
-            f"Event {event_file.name}: "
-            f"final trim "
-            f"offset={trim_offset:.3f}s "
-            f"duration={final_duration:.3f}s"
-        )
-
-        result = subprocess.run(
-            final_command
-        )
-
-        if result.returncode != 0:
-
-            log(
-                f"Event {event_file.name}: "
-                f"FFmpeg final trim ERROR: "
-                f"exit code {result.returncode}"
-            )
-
-            return
-
-        # --------------------------------------------------
-        # Validate
-        # --------------------------------------------------
-
-        if not validate_video(
-            output_file
-        ):
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR: generated video "
-                f"failed validation"
-            )
-
-            try:
-
-                output_file.unlink()
-
-            except FileNotFoundError:
-
-                pass
-
-            return
-
-        # --------------------------------------------------
-        # Move to ready
-        # --------------------------------------------------
-
-        READY_DIR.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        ready_file = (
-            READY_DIR /
-            output_file.name
-        )
-
-        try:
-
-            output_file.rename(
-                ready_file
-            )
-
-        except Exception as e:
-
-            log(
-                f"Event {event_file.name}: "
-                f"ERROR moving video to ready: "
-                f"{e}"
-            )
-
-            return
-
-        log(
-            f"Event {event_file.name}: "
-            f"RECORDING READY: "
-            f"{ready_file.name}"
-        )
-
-        # --------------------------------------------------
-        # MQTT
-        # --------------------------------------------------
-
-        if mqtt_client is None:
-
-            log(
-                "MQTT unavailable; "
-                "video remains in ready/"
-            )
-
-            return
-
-        try:
-
-            result = mqtt_client.publish(
-                MQTT_TOPIC,
-                str(ready_file),
-                qos=1,
-                retain=False
-            )
-
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-
-                log(
-                    f"MQTT published: "
-                    f"{ready_file}"
-                )
-
-            else:
-
-                log(
-                    f"MQTT publish failed: "
-                    f"rc={result.rc}"
-                )
-
-        except Exception as e:
-
-            log(
-                f"MQTT publish exception: "
-                f"{e}"
-            )
 
     finally:
+        try:
+            for path in work_dir.glob("*"):
+                path.unlink(missing_ok=True)
+            work_dir.rmdir()
+        except Exception:
+            pass
 
-        if temp_event_dir is not None:
-
-            shutil.rmtree(
-                temp_event_dir,
-                ignore_errors=True
-            )
-
-        delete_event_marker(
-            event_file
-        )
-
-
-# ==================================================
-# Main
-# ==================================================
 
 def main():
+    log.info("Event processor started")
+    log.info("Buffer: %ss, segment: %ss", BUFFER_SECONDS, SEGMENT_SECONDS)
+    log.info("Video bitrate: %s", VIDEO_BITRATE)
 
-    log(
-        "Event processor started."
-    )
-
-    log(
-        f"Ready retention: "
-        f"{READY_RETENTION_DAYS} day(s)"
-    )
-
-    log(
-        f"Segment duration: "
-        f"{SEGMENT_SECONDS}s"
-    )
-
-    EVENT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    RECORD_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    READY_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    TEMP_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # Initial cleanup
-
-    cleanup_ready_directory()
-
-    mqtt_connect()
-
-    executor = ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    )
-
-    submitted = set()
-
-    last_cleanup = 0
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    futures = {}
+    retry_at = {}
 
     while True:
+        try:
+            for event_file, future in list(futures.items()):
+                if future.done():
+                    try:
+                        success = future.result()
+                    except Exception as e:
+                        log.error("Worker exception for %s: %s", event_file.name, e)
+                        success = False
 
-        # --------------------------------------------------
-        # Periodic cleanup
-        # --------------------------------------------------
+                    del futures[event_file]
 
-        current_time = time.time()
+                    if not success and event_file.exists():
+                        retry_at[event_file] = time.time() + RETRY_DELAY
+                        log.warning("Event will be retried: %s", event_file.name)
 
-        if (
-            current_time -
-            last_cleanup
-            >= 3600
-        ):
+            for event_file in sorted(EVENT_DIR.glob("event_*.evt")):
+                if event_file in futures:
+                    continue
 
-            cleanup_ready_directory()
+                if time.time() < retry_at.get(event_file, 0):
+                    continue
 
-            last_cleanup = current_time
+                futures[event_file] = executor.submit(process_event, event_file)
 
-        # --------------------------------------------------
-        # Process events
-        # --------------------------------------------------
+            time.sleep(1)
 
-        events = sorted(
-            EVENT_DIR.glob(
-                "event_*.evt"
-            )
-        )
+        except Exception as e:
+            log.exception("Main loop error: %s", e)
+            time.sleep(2)
 
-        for event_file in events:
-
-            if event_file in submitted:
-
-                continue
-
-            submitted.add(
-                event_file
-            )
-
-            log(
-                f"Submitting event: "
-                f"{event_file.name}"
-            )
-
-            executor.submit(
-                process_event,
-                event_file
-            )
-
-        existing_events = set(
-            EVENT_DIR.glob(
-                "event_*.evt"
-            )
-        )
-
-        submitted.intersection_update(
-            existing_events
-        )
-
-        time.sleep(0.1)
-
-
-# ==================================================
-# Start
-# ==================================================
 
 if __name__ == "__main__":
     main()
