@@ -87,11 +87,22 @@ while true; do
 import sys
 from pathlib import Path
 
-files = [p for p in Path(sys.argv[1]).glob("segment_*.ts") if p.is_file() and p.stat().st_size > 0]
+newest = None
+newest_time = 0
 
-if files:
-    path = max(files, key=lambda p: p.stat().st_mtime)
-    print(f"{path.stat().st_mtime} {path}")
+for path in Path(sys.argv[1]).glob("segment_*.ts"):
+    try:
+        if path.stat().st_size <= 0:
+            continue
+        mtime = path.stat().st_mtime
+        if mtime > newest_time:
+            newest = path
+            newest_time = mtime
+    except FileNotFoundError:
+        continue
+
+if newest:
+    print(f"{newest_time} {newest}")
 PY
 )
 
