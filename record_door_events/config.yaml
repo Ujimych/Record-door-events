@@ -1,5 +1,5 @@
 name: Record Door Events
-version: "0.8.2"
+version: "0.8.3"
 slug: record_door_events
 description: "Record door events and prepare videos for sending to Telegram"
 url: "https://github.com/Ujimych/Record-door-events"
