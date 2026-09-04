@@ -15,7 +15,7 @@ arch:
 options:
   rtsp_url: ""
   rtsp_transport: "tcp"
-  buffer_seconds: 60
+  buffer_seconds: 70
   segment_seconds: 1
   pre_event_seconds: 5
   post_event_seconds: 10
