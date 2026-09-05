@@ -5,6 +5,7 @@ echo " Record door events"
 echo "======================================"
 
 OPTIONS="/data/options.json"
+
 RTSP_URL="$(python3 -c "import json; print(json.load(open('$OPTIONS'))['rtsp_url'])")"
 RTSP_TRANSPORT="$(python3 -c "import json; print(json.load(open('$OPTIONS')).get('rtsp_transport', 'tcp'))")"
 BUFFER_SECONDS="$(python3 -c "import json; print(json.load(open('$OPTIONS'))['buffer_seconds'])")"
@@ -55,6 +56,7 @@ PY
 }
 
 cleanup &
+
 python3 /event_processor.py &
 
 while true; do
@@ -62,9 +64,11 @@ while true; do
 
     find "$BUFFER_DIR" -name "segment_*.ts" -type f -size 0 -delete
 
+    FFmpeg_START_TIME=$(date +%s)
+
     ffmpeg \
         -hide_banner \
-        -loglevel error \
+        -loglevel warning \
         -rtsp_transport "$RTSP_TRANSPORT" \
         -i "$RTSP_URL" \
         -an \
@@ -76,28 +80,39 @@ while true; do
         "$BUFFER_DIR/segment_%Y%m%d_%H%M%S.ts" &
 
     FFMPEG_PID=$!
-    START_TIME=$(date +%s)
 
     echo "FFmpeg started. PID: $FFMPEG_PID"
 
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
         sleep 5
 
-        NEWEST_SEGMENT=$(python3 - "$BUFFER_DIR" <<'PY'
+        NOW=$(date +%s)
+        UPTIME=$((NOW - FFmpeg_START_TIME))
+
+        NEWEST_SEGMENT=$(python3 - "$BUFFER_DIR" "$FFmpeg_START_TIME" <<'PY'
 import sys
 from pathlib import Path
+
+directory = Path(sys.argv[1])
+start_time = float(sys.argv[2])
 
 newest = None
 newest_time = 0
 
-for path in Path(sys.argv[1]).glob("segment_*.ts"):
+for path in directory.glob("segment_*.ts"):
     try:
-        if path.stat().st_size <= 0:
+        stat = path.stat()
+
+        if stat.st_size <= 0:
             continue
-        mtime = path.stat().st_mtime
-        if mtime > newest_time:
+
+        if stat.st_mtime < start_time:
+            continue
+
+        if stat.st_mtime > newest_time:
             newest = path
-            newest_time = mtime
+            newest_time = stat.st_mtime
+
     except FileNotFoundError:
         continue
 
@@ -106,34 +121,36 @@ if newest:
 PY
 )
 
-        NOW=$(date +%s)
-        UPTIME=$((NOW - START_TIME))
-
         if [ -z "$NEWEST_SEGMENT" ]; then
             if [ "$UPTIME" -gt "$STARTUP_GRACE" ]; then
-                echo "WATCHDOG: no segments after ${UPTIME}s. Restarting FFmpeg..."
+                echo "WATCHDOG: no new segments after ${UPTIME}s. Restarting FFmpeg..."
+
                 kill "$FFMPEG_PID" 2>/dev/null
                 sleep 2
 
                 if kill -0 "$FFMPEG_PID" 2>/dev/null; then
+                    echo "WATCHDOG: FFmpeg did not stop, killing..."
                     kill -9 "$FFMPEG_PID" 2>/dev/null
                 fi
 
                 break
             fi
+
             continue
         fi
 
         LAST_UPDATE="${NEWEST_SEGMENT%% *}"
+
         AGE=$(python3 - "$LAST_UPDATE" <<'PY'
 import sys
 import time
+
 print(int(time.time() - float(sys.argv[1])))
 PY
 )
 
         if [ "$AGE" -gt "$WATCHDOG_TIMEOUT" ]; then
-            echo "WATCHDOG: newest segment is ${AGE}s old. Restarting FFmpeg..."
+            echo "WATCHDOG: newest new segment is ${AGE}s old. Restarting FFmpeg..."
             echo "WATCHDOG: $NEWEST_SEGMENT"
 
             kill "$FFMPEG_PID" 2>/dev/null
