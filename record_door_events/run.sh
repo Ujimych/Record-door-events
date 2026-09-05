@@ -75,6 +75,7 @@ while true; do
         -c:v copy \
         -f segment \
         -segment_time "$SEGMENT_SECONDS" \
+        -reset_timestamps 1 \
         -strftime 1 \
         -segment_format mpegts \
         "$BUFFER_DIR/segment_%Y%m%d_%H%M%S.ts" &
