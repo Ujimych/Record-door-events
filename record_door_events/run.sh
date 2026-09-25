@@ -78,7 +78,7 @@ while true; do
         -loglevel warning \
         -fflags +genpts+discardcorrupt \
         -rtsp_transport "$RTSP_TRANSPORT" \
-        -stimeout 5000000 \
+        -timeout 5000000 \
         -i "$RTSP_URL" \
         -an \
         -c:v copy \
