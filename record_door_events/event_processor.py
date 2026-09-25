@@ -16,7 +16,7 @@ MQTT_TOPIC = "record_door_events/video_ready"
 
 STALE_BUFFER_SECONDS = 120
 RETRY_DELAY = 5
-MAX_WORKERS = 10
+MAX_WORKERS = 4
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("event_processor")
@@ -49,7 +49,8 @@ MQTT_PASSWORD = OPTIONS.get("mqtt_password", "")
 
 def parse_event_time(path):
     try:
-        return float(path.stem.replace("event_", ""))
+        name = path.stem.replace("event_", "")
+        return float(name)
     except Exception:
         return None
 
@@ -152,7 +153,12 @@ def validate_video(path):
             log.error("Validation failed: %s", result.stderr.strip())
             return False
 
-        duration = float(result.stdout.strip())
+        stdout_val = result.stdout.strip()
+        if not stdout_val or stdout_val == "N/A":
+            log.error("Validation data is N/A or empty")
+            return False
+
+        duration = float(stdout_val)
 
         try:
             size = path.stat().st_size / 1024 / 1024
@@ -191,6 +197,7 @@ def process_event(event_file):
 
     if not segments:
         log.warning("No buffer segments available")
+        delete_event_marker(event_file)
         return False
 
     newest_time = segments[-1][0]
@@ -198,20 +205,19 @@ def process_event(event_file):
 
     if age > STALE_BUFFER_SECONDS:
         log.warning("Buffer is stale; newest segment is %.1fs old: %s", age, datetime.fromtimestamp(newest_time))
+        delete_event_marker(event_file)
         return False
 
     selected = [(ts, path) for ts, path in segments if ts <= end_time and ts + SEGMENT_SECONDS >= start_time]
 
     if not selected:
         log.warning("No suitable segments for event %s", event_file.name)
+        delete_event_marker(event_file)
         return False
 
     selected = sorted(selected)
 
     log.info("Event %s: selected %d segment(s)", event_file.name, len(selected))
-
-    for _, path in selected:
-        log.info("  %s", path.name)
 
     stamp = datetime.fromtimestamp(event_time).strftime("%Y%m%d_%H%M%S")
     base = f"event_{stamp}_{int(event_time * 1000) % 1000:03d}"
@@ -219,6 +225,7 @@ def process_event(event_file):
     work_dir = TEMP_DIR / base
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    temp_output_file = work_dir / "output_temp.mp4"
     output_file = READY_DIR / f"{base}.mp4"
 
     try:
@@ -243,19 +250,21 @@ def process_event(event_file):
             "-c:v", "copy",
             "-an",
             "-movflags", "+faststart",
-            "-y", str(output_file)
+            "-y", str(temp_output_file)
         ]
 
         if not run_ffmpeg(command):
             log.error("FFmpeg processing failed for event %s", event_file.name)
             return False
 
-        if not validate_video(output_file):
-            log.error("Video validation failed for output: %s", output_file.name)
-            try:
-                output_file.unlink()
-            except FileNotFoundError:
-                pass
+        if not validate_video(temp_output_file):
+            log.error("Video validation failed for temp output: %s", temp_output_file.name)
+            return False
+
+        try:
+            temp_output_file.rename(output_file)
+        except Exception as e:
+            log.error("Failed to move finished video to ready folder: %s", e)
             return False
 
         if not publish_mqtt(output_file):
@@ -265,8 +274,10 @@ def process_event(event_file):
         delete_event_marker(event_file)
 
         try:
-            concat_file.unlink()
-            work_dir.rmdir()
+            if concat_file.exists():
+                concat_file.unlink()
+            if work_dir.exists():
+                work_dir.rmdir()
         except Exception:
             pass
 
@@ -274,6 +285,7 @@ def process_event(event_file):
 
     except Exception as e:
         log.error("Error processing event %s: %s", event_file.name, e)
+        delete_event_marker(event_file)
         return False
 
 
@@ -286,8 +298,15 @@ def main():
             try:
                 event_files = sorted(EVENT_DIR.glob("event_*"))
                 for event_file in event_files:
-                    if event_file.is_file():
-                        executor.submit(process_event, event_file)
+                    if event_file.is_file() and (event_file.suffix == '.evt' or event_file.suffix == ''):
+                        
+                        processing_file = event_file.with_suffix('.started')
+                        try:
+                            event_file.rename(processing_file)
+                        except FileNotFoundError:
+                            continue
+                        
+                        executor.submit(process_event, processing_file)
             except Exception as e:
                 log.error("Error in main loop: %s", e)
             time.sleep(1)
