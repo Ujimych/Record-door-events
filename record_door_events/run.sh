@@ -35,30 +35,23 @@ echo "Maximum segments: $MAX_SEGMENTS"
 echo "Watchdog timeout: ${WATCHDOG_TIMEOUT}s"
 
 cleanup() {
-    echo "Cleanup process started with safety margin."
+    echo "Cleanup process started."
     while true; do
         python3 - "$BUFFER_DIR" "$MAX_SEGMENTS" <<'PY'
 import sys
 from pathlib import Path
-import time
 
 directory = Path(sys.argv[1])
 limit = int(sys.argv[2])
+files = sorted(directory.glob("segment_*.ts"), key=lambda p: p.name)
 
-now = time.time()
-files = sorted(
-    [p for p in directory.glob("segment_*.ts") if now - p.stat().st_mtime > 30],
-    key=lambda p: p.name
-)
-
-if len(files) > limit:
-    for path in files[:-limit]:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+for path in files[:-limit]:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 PY
-        sleep 10
+        sleep 2
     done
 }
 
@@ -76,9 +69,7 @@ while true; do
     ffmpeg \
         -hide_banner \
         -loglevel warning \
-        -fflags +genpts+discardcorrupt \
         -rtsp_transport "$RTSP_TRANSPORT" \
-        -timeout 5000000 \
         -i "$RTSP_URL" \
         -an \
         -c:v copy \
@@ -179,7 +170,7 @@ PY
     EXIT_CODE=$?
 
     echo "FFmpeg stopped. Exit code: $EXIT_CODE"
-    echo "Restarting FFmpeg in 15 seconds..."
+    echo "Restarting FFmpeg in 3 seconds..."
 
-    sleep 15
+    sleep 3
 done
