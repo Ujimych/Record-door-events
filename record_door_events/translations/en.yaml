@@ -27,6 +27,14 @@ configuration:
     name: Video retention
     description: Number of days to keep generated videos.
 
+  debug_mode:
+    name: Debug mode
+    description: Keep copied source segments and log.txt for each event in the tmp directory.
+
+  event_data_retention_days:
+    name: Event data retention
+    description: Number of days to keep event data folders when debug mode is enabled.
+
   watchdog_timeout:
     name: Watchdog timeout
     description: Restart FFmpeg if no new video segment appears within this time.
