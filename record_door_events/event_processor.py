@@ -240,14 +240,33 @@ def run_ffmpeg(command, timeout=300):
         return False
 
 
+def observed_segment_interval(segments):
+    intervals = sorted(
+        next_ts - ts
+        for (ts, _), (next_ts, _) in zip(segments, segments[1:])
+        if next_ts > ts
+    )
+
+    if not intervals:
+        return SEGMENT_SECONDS
+
+    return intervals[len(intervals) // 2]
+
+
 def wait_for_segments(end_time):
-    wait_until = end_time + max(3.0, SEGMENT_SECONDS * 2)
+    # The camera, not segment_seconds, decides the real segment length: with
+    # stream copy FFmpeg can only split at keyframes. Wait until a segment
+    # starting at or after the end of the window exists. Its presence means
+    # that the previous segment (the one covering the end of the event) is
+    # closed and can be copied without truncating the recording.
+    typical = observed_segment_interval(get_segments())
+    wait_until = time.time() + min(30.0, max(10.0, typical * 2.0 + 2.0))
 
     while time.time() < wait_until:
         segments = get_segments()
         if segments and segments[-1][0] >= end_time:
             return segments
-        time.sleep(1)
+        time.sleep(0.5)
 
     return get_segments()
 
@@ -396,12 +415,18 @@ def validate_video(path, expected_duration):
         log.error("Validation failed: cannot determine duration")
         return False
 
-    minimum = MIN_OUTPUT_SECONDS
-    if expected_duration is not None:
-        minimum = max(minimum, expected_duration * OUTPUT_DURATION_RATIO)
+    # The requested clip length is the primary requirement. A source segment
+    # with compressed MPEG-TS timestamps can contain the right number of
+    # frames but report a shorter duration, so do not lower the minimum just
+    # because expected_duration was calculated from those timestamps. The
+    # normalized-timestamp fallback rebuilds the clip from its frames.
+    minimum = max(MIN_OUTPUT_SECONDS, TARGET_DURATION * OUTPUT_DURATION_RATIO)
 
     if duration < minimum:
-        log.error("Validation failed: %.2fs, expected at least %.2fs", duration, minimum)
+        log.error(
+            "Validation failed: %.2fs, expected at least %.2fs (source window %.2fs)",
+            duration, minimum, expected_duration or 0.0
+        )
         return False
 
     fps = get_video_fps(path)
@@ -414,16 +439,7 @@ def get_segment_gap_limit(segments):
     # can only split on keyframes, so a configured one-second segment may
     # actually be four or more seconds long. Use the observed interval to
     # avoid dropping a segment that already contains the start of the window.
-    intervals = sorted(
-        next_ts - ts
-        for (ts, _), (next_ts, _) in zip(segments, segments[1:])
-        if next_ts > ts
-    )
-
-    if not intervals:
-        return SEGMENT_GAP_LIMIT
-
-    typical = intervals[len(intervals) // 2]
+    typical = observed_segment_interval(segments)
     return max(SEGMENT_GAP_LIMIT, min(30.0, typical * 2.5))
 
 
@@ -537,13 +553,19 @@ def build_video(work_dir, concat_file, trim_offset, source_fps, normalize=False)
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
     ]
 
-    if not normalize:
-        command += ["-ss", f"{trim_offset:.3f}"]
-
     command += [
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
     ]
+
+    if not normalize:
+        # Seek after the input. Input-side seeking on the concat demuxer is
+        # inaccurate for MPEG-TS segments: every segment starts at a non-zero
+        # PTS, and the concat timeline can overlap at segment boundaries. In
+        # that case FFmpeg silently skips several seconds of footage, so the
+        # resulting clip can be shorter than the requested event window even
+        # though all required segments are present.
+        command += ["-ss", f"{trim_offset:.3f}"]
 
     if normalize:
         # Rebuild the timeline from the number of decoded frames. This is a
