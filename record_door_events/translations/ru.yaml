@@ -1,0 +1,56 @@
+configuration:
+  rtsp_url:
+    name: RTSP-адрес
+    description: RTSP-адрес видеопотока камеры.
+
+  rtsp_transport:
+    name: Транспорт RTSP
+    description: Протокол транспорта для RTSP-потока.
+
+  buffer_seconds:
+    name: Длительность буфера
+    description: Продолжительность кольцевого видеобуфера в секундах.
+
+  segment_seconds:
+    name: Длительность сегмента
+    description: Продолжительность каждого видеосегмента в секундах.
+
+  pre_event_seconds:
+    name: Запись до события
+    description: Количество секунд видео до события.
+
+  post_event_seconds:
+    name: Запись после события
+    description: Количество секунд видео после события.
+
+  ready_retention_days:
+    name: Хранение готовых видео
+    description: Количество дней хранения готовых видеофайлов.
+
+  debug_mode:
+    name: Режим отладки
+    description: Сохранять скопированные сегменты и log.txt каждого события в каталоге tmp.
+
+  event_data_retention_days:
+    name: Хранение данных событий
+    description: Количество дней хранения папок с данными событий при включённом режиме отладки.
+
+  watchdog_timeout:
+    name: Таймаут watchdog
+    description: Перезапустить FFmpeg, если новый видеосегмент не появляется дольше указанного времени.
+
+  mqtt_host:
+    name: MQTT-хост
+    description: Имя хоста MQTT-брокера.
+
+  mqtt_port:
+    name: MQTT-порт
+    description: Порт MQTT-брокера.
+
+  mqtt_username:
+    name: MQTT-пользователь
+    description: Имя пользователя MQTT.
+
+  mqtt_password:
+    name: MQTT-пароль
+    description: Пароль MQTT.
