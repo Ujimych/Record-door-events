@@ -52,8 +52,11 @@ It waits for:
 post_event_seconds + 2 * segment_seconds
 ```
 
-and for the required buffer segments to be closed. After that, the segments are copied into the event directory without
-re-encoding or modification. The application selects segments covering the window
+and for a segment starting at or after the end of the event window. Because
+segments are split at camera keyframes, this confirms that the segment
+covering the end of the window is closed. After that, the segments are copied
+into the event directory without re-encoding or modification. The application
+selects segments covering the window
 from `event_time - pre_event_seconds` to `event_time + post_event_seconds`. Because
 the real segment duration depends on the camera keyframe interval, selection is based
 on the segment start times rather than on a fixed segment count.
@@ -358,7 +361,7 @@ source and the result can be compared directly.
 The application version is defined in one place:
 
 ```yaml
-version: "0.8.11"
+version: "0.8.12"
 ```
 
 in `config.yaml`.
