@@ -15,6 +15,8 @@ Telegram delivery is handled by Home Assistant automation.
 - Configurable pre-event recording
 - Configurable post-event recording
 - Automatic event video creation
+- Optional debug mode with the original copied segments and an event log
+- Configurable retention for debug data and generated videos
 - MQTT notification when a video is ready
 - Automatic cleanup of old videos
 - Supports `amd64` and `aarch64`
@@ -27,25 +29,51 @@ The application continuously records the configured RTSP stream into short MPEG-
 
 The segments are stored in a rolling buffer. Old segments are automatically removed when the configured buffer duration is exceeded.
 
+The buffer is recorded with `-c:v copy`, so FFmpeg can only split the stream at
+camera keyframes. The real segment length can therefore be longer than
+`segment_seconds`; the event window is selected by segment start times, not by a
+fixed number of segments.
+
 When Home Assistant detects a door event, it creates an event marker:
 
 ```text
 /media/record-door-events/events/event_<timestamp>.evt
 ```
 
-The application detects the event marker and waits for the configured post-event period.
+The application detects the event marker and creates an event data directory in `tmp/`:
 
-It then creates a video containing:
+```text
+/media/record-door-events/tmp/event_<timestamp>/
+```
 
-- footage before the event
-- the event itself
-- footage after the event
+It waits for:
 
-The resulting MP4 file is placed in:
+```text
+post_event_seconds + 2 * segment_seconds
+```
+
+and for the required buffer segments to be closed. After that, the segments are copied into the event directory without
+re-encoding or modification. The application selects segments covering the window
+from `event_time - pre_event_seconds` to `event_time + post_event_seconds`. Because
+the real segment duration depends on the camera keyframe interval, selection is based
+on the segment start times rather than on a fixed segment count.
+
+The event directory also contains:
+
+- `log.txt` — the oldest buffer segment at copy time and the list of copied segments;
+  the segment containing the event is marked with `<- event`;
+- `concat.txt` — the FFmpeg concat list used for diagnostics;
+- `event.mp4` — the assembled video.
+
+The resulting MP4 file is copied to:
 
 ```text
 /media/record-door-events/ready/
 ```
+
+If debug mode is disabled, the event data directory is removed after processing. If
+debug mode is enabled, the directory is kept and old event directories are removed
+after `event_data_retention_days`.
 
 The application publishes the path of the generated video through MQTT:
 
@@ -93,6 +121,8 @@ pre_event_seconds: 5
 post_event_seconds: 10
 
 ready_retention_days: 3
+debug_mode: false
+event_data_retention_days: 3
 
 mqtt_host: "core-mosquitto"
 mqtt_port: 1883
@@ -110,6 +140,8 @@ mqtt_password: ""
 | `pre_event_seconds` | Number of seconds recorded before the event | `5` |
 | `post_event_seconds` | Number of seconds recorded after the event | `10` |
 | `ready_retention_days` | Number of days to keep generated videos in `ready/` | `3` |
+| `debug_mode` | Keep copied event segments and `log.txt` in `tmp/` | `false` |
+| `event_data_retention_days` | Number of days to keep event data folders in debug mode | `3` |
 | `mqtt_host` | MQTT broker hostname | `core-mosquitto` |
 | `mqtt_port` | MQTT broker port | `1883` |
 | `mqtt_username` | MQTT username | — |
@@ -124,6 +156,8 @@ mqtt_password: ""
 | `pre_event_seconds` | `0–60` |
 | `post_event_seconds` | `1–120` |
 | `ready_retention_days` | `1–30` |
+| `debug_mode` | `true` or `false` |
+| `event_data_retention_days` | `1–30` |
 
 ## Home Assistant automation
 
@@ -225,7 +259,6 @@ The application uses the following directories:
 /media/record-door-events/
 ├── buffer/
 ├── events/
-├── recordings/
 ├── ready/
 └── tmp/
 ```
@@ -240,9 +273,11 @@ Old segments are automatically removed according to the configured buffer durati
 
 Contains event marker files created by Home Assistant.
 
-### `recordings/`
+This directory is required: the application watches it for `event_*.evt` files and
+deletes each marker after successful processing.
 
-Temporary storage for newly generated event videos before they are moved to `ready/`.
+The former `recordings/` directory is no longer used. Older installations may still
+contain it, but it can be removed safely.
 
 ### `ready/`
 
@@ -262,9 +297,44 @@ The default retention period is:
 
 ### `tmp/`
 
-Temporary files used while creating event videos.
+Contains one event data directory per event:
 
-Temporary files are removed after processing.
+```text
+tmp/event_<timestamp>/
+├── log.txt
+├── concat.txt
+├── segment_*.ts
+└── event.mp4
+```
+
+The segments are exact copies of the source buffer segments. They are not re-encoded.
+
+If `debug_mode` is disabled, the directory is deleted after processing. If debug mode
+is enabled, the directory is kept and old directories are removed after
+`event_data_retention_days` (the check runs at startup and after each processed event).
+
+Debug data can be used to check segment durations, inspect the source quality, tune
+the buffer and segment settings, and reproduce the final video assembly manually.
+Enable it temporarily: copied segments can take significant disk space.
+
+### Debug log
+
+Example `log.txt`:
+
+```text
+segment_20261117_095039.ts    <- old
+
+segment_20261117_095125.ts
+segment_20261117_095129.ts
+segment_20261117_095133.ts
+segment_20261117_095137.ts
+segment_20261117_095141.ts    <- event
+segment_20261117_095144.ts
+```
+
+The first line is the oldest buffer segment at the moment the event directory was
+filled. The blank line is followed by the copied segments. The segment containing the
+event timestamp is marked with `<- event`.
 
 ## Video processing
 
@@ -272,18 +342,23 @@ The application uses FFmpeg to:
 
 1. record the RTSP stream;
 2. maintain the rolling buffer;
-3. combine the required segments;
-4. create the final MP4 event video;
+3. copy the required segments into the event data directory;
+4. combine the copied segments into the final MP4 event video;
 5. validate the generated video.
 
-The generated video uses H.264 video encoding and MP4 container format.
+The generated video uses H.264 video encoding and MP4 container format. Encoding uses
+constant quality (CRF 18) with a 12 Mbit/s ceiling instead of a fixed low bitrate, so
+the result keeps the camera detail and does not turn into a heavily compressed clip.
+
+The event data directory keeps the original copied segments, so the quality of the
+source and the result can be compared directly.
 
 ## Versioning
 
 The application version is defined in one place:
 
 ```yaml
-version: "0.7.5"
+version: "0.8.11"
 ```
 
 in `config.yaml`.
@@ -300,7 +375,10 @@ record_door_events/
 ├── Dockerfile
 ├── event_processor.py
 ├── run.sh
-└── icon.png
+├── icon.png
+└── translations/
+    ├── en.yaml
+    └── ru.yaml
 ```
 
 ### `config.yaml`
