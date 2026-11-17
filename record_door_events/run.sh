@@ -19,35 +19,52 @@ fi
 
 BUFFER_DIR="/media/record-door-events/buffer"
 EVENT_DIR="/media/record-door-events/events"
-RECORD_DIR="/media/record-door-events/recordings"
 READY_DIR="/media/record-door-events/ready"
 
-mkdir -p "$BUFFER_DIR" "$EVENT_DIR" "$RECORD_DIR" "$READY_DIR"
+mkdir -p "$BUFFER_DIR" "$EVENT_DIR" "$READY_DIR"
 
-MAX_SEGMENTS=$((BUFFER_SECONDS / SEGMENT_SECONDS + 10))
+BUFFER_RETENTION_SECONDS=$((BUFFER_SECONDS + 10))
 STARTUP_GRACE=30
 
 echo "RTSP: configured"
 echo "RTSP transport: $RTSP_TRANSPORT"
 echo "Buffer: ${BUFFER_SECONDS}s"
-echo "Segment: ${SEGMENT_SECONDS}s"
-echo "Maximum segments: $MAX_SEGMENTS"
+echo "Segment: ${SEGMENT_SECONDS}s (actual split follows camera keyframes)"
+echo "Buffer retention: ${BUFFER_RETENTION_SECONDS}s"
 echo "Watchdog timeout: ${WATCHDOG_TIMEOUT}s"
 
 cleanup() {
     echo "Cleanup process started."
     while true; do
-        python3 - "$BUFFER_DIR" "$MAX_SEGMENTS" <<'PY'
+        python3 - "$BUFFER_DIR" "$BUFFER_RETENTION_SECONDS" <<'PY'
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 directory = Path(sys.argv[1])
-limit = int(sys.argv[2])
+retention = float(sys.argv[2])
+cutoff = time.time() - retention
 files = sorted(directory.glob("segment_*.ts"), key=lambda p: p.name)
 
-for path in files[:-limit]:
+# The newest segment may still be written by FFmpeg; never remove it.
+for path in files[:-1]:
+    try:
+        timestamp = datetime.strptime(
+            path.stem.replace("segment_", ""), "%Y%m%d_%H%M%S"
+        ).timestamp()
+    except ValueError:
+        try:
+            timestamp = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+
+    if timestamp >= cutoff:
+        continue
+
     try:
         path.unlink()
+        print(f"Removed old buffer segment: {path.name}")
     except FileNotFoundError:
         pass
 PY
