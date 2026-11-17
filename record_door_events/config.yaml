@@ -1,5 +1,5 @@
 name: Record Door Events
-version: "0.8.10"
+version: "0.8.11"
 slug: record_door_events
 description: "Record door events and prepare videos for sending to Telegram"
 url: "https://github.com/Ujimych/Record-door-events"
@@ -20,6 +20,8 @@ options:
   pre_event_seconds: 5
   post_event_seconds: 10
   ready_retention_days: 3
+  debug_mode: false
+  event_data_retention_days: 3
   watchdog_timeout: 20
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -34,6 +36,8 @@ schema:
   pre_event_seconds: int(0,60)
   post_event_seconds: int(1,120)
   ready_retention_days: int(1,30)
+  debug_mode: bool
+  event_data_retention_days: int(1,30)
   watchdog_timeout: int(10,120)
   mqtt_host: str
   mqtt_port: int
