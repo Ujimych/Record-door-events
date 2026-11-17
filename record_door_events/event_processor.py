@@ -20,38 +20,17 @@ STALE_BUFFER_SECONDS = 120
 RETRY_DELAY = 5
 MAX_WORKERS = 10
 
-VIDEO_BITRATE = "2M"
-VIDEO_MAXRATE = "2M"
-VIDEO_BUFSIZE = "4M"
+# Keep the encoded clip close to the source quality. A fixed low bitrate
+# destroyed fine details on high-resolution cameras, especially at night.
+VIDEO_CRF = "18"
+VIDEO_MAXRATE = "12M"
+VIDEO_BUFSIZE = "24M"
 
 OUTPUT_MIN_SIZE = 10 * 1024
 OUTPUT_DURATION_RATIO = 0.95
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("event_processor")
-
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-READY_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def cleanup_temp_dir():
-    # Remove leftovers from an interrupted event build.
-    try:
-        entries = list(TEMP_DIR.iterdir())
-    except OSError:
-        return
-
-    for path in entries:
-        try:
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-cleanup_temp_dir()
 
 
 def load_options():
@@ -69,6 +48,103 @@ BUFFER_SECONDS = float(OPTIONS.get("buffer_seconds", 60))
 PRE_EVENT = float(OPTIONS.get("pre_event_seconds", 5))
 POST_EVENT = float(OPTIONS.get("post_event_seconds", 10))
 TARGET_DURATION = PRE_EVENT + POST_EVENT
+DEBUG_MODE = bool(OPTIONS.get("debug_mode", False))
+EVENT_DATA_RETENTION_DAYS = max(1, int(OPTIONS.get("event_data_retention_days", 3)))
+READY_RETENTION_DAYS = max(1, int(OPTIONS.get("ready_retention_days", 3)))
+EVENT_DATA_RETENTION_SECONDS = EVENT_DATA_RETENTION_DAYS * 24 * 60 * 60
+READY_RETENTION_SECONDS = READY_RETENTION_DAYS * 24 * 60 * 60
+
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+READY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def remove_path(path):
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("Cannot remove %s: %s", path, e)
+
+
+def event_dir_timestamp(path):
+    parts = path.name.split("_")
+    if len(parts) >= 4 and parts[0] == "event":
+        try:
+            start = datetime.strptime(
+                f"{parts[1]}_{parts[2]}", "%Y%m%d_%H%M%S"
+            ).timestamp()
+            return start + int(parts[3]) / 1000.0
+        except (ValueError, IndexError):
+            pass
+
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def cleanup_temp_dir():
+    # Remove leftovers from interrupted builds. In debug mode recent event
+    # folders are kept so that the copied segments can be inspected.
+    try:
+        entries = list(TEMP_DIR.iterdir())
+    except OSError:
+        return
+
+    now = time.time()
+
+    for path in entries:
+        if DEBUG_MODE and path.is_dir() and path.name.startswith("event_"):
+            timestamp = event_dir_timestamp(path)
+            if timestamp is not None and now - timestamp <= EVENT_DATA_RETENTION_SECONDS:
+                continue
+
+        remove_path(path)
+
+
+cleanup_temp_dir()
+
+
+def cleanup_event_data(keep_path=None):
+    if not DEBUG_MODE:
+        if keep_path is not None:
+            remove_path(keep_path)
+        return
+
+    now = time.time()
+
+    for path in TEMP_DIR.glob("event_*"):
+        if keep_path is not None and path == keep_path:
+            continue
+
+        if not path.is_dir():
+            continue
+
+        timestamp = event_dir_timestamp(path)
+        if timestamp is None or now - timestamp > EVENT_DATA_RETENTION_SECONDS:
+            log.info("Removing old event data: %s", path.name)
+            remove_path(path)
+
+
+def prune_ready_dir(keep_path=None):
+    now = time.time()
+
+    for path in READY_DIR.glob("*.mp4"):
+        if keep_path is not None and path == keep_path:
+            continue
+
+        try:
+            if now - path.stat().st_mtime <= READY_RETENTION_SECONDS:
+                continue
+            path.unlink()
+            log.info("Removed old ready video: %s", path.name)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("Cannot remove old ready video %s: %s", path, e)
+
 
 # Segment names contain the wall-clock start of the segment. The segment
 # before the requested window is used only when it is close enough to belong
@@ -143,9 +219,18 @@ def run_ffmpeg(command, timeout=300):
             text=True,
             timeout=timeout
         )
+        stderr = result.stderr.strip()
+
         if result.returncode != 0:
-            log.error("FFmpeg failed: %s", result.stderr.strip()[-2000:])
+            log.error("FFmpeg failed: %s", stderr[-2000:])
             return False
+
+        if stderr:
+            # A successful encode can still contain decoder errors from a
+            # damaged source segment. Keep them in the application log so the
+            # copied debug segments can be checked later.
+            log.warning("FFmpeg diagnostics: %s", stderr[-2000:])
+
         return True
     except subprocess.TimeoutExpired:
         log.error("FFmpeg timed out")
@@ -194,7 +279,7 @@ def copy_segment(source, destination):
         return False
 
     try:
-        shutil.copyfile(source, destination)
+        shutil.copy2(source, destination)
     except FileNotFoundError:
         log.warning("Segment disappeared while copying: %s", source.name)
         return False
@@ -324,6 +409,24 @@ def validate_video(path, expected_duration):
     return True
 
 
+def get_segment_gap_limit(segments):
+    # The camera decides the real segment duration: with stream copy FFmpeg
+    # can only split on keyframes, so a configured one-second segment may
+    # actually be four or more seconds long. Use the observed interval to
+    # avoid dropping a segment that already contains the start of the window.
+    intervals = sorted(
+        next_ts - ts
+        for (ts, _), (next_ts, _) in zip(segments, segments[1:])
+        if next_ts > ts
+    )
+
+    if not intervals:
+        return SEGMENT_GAP_LIMIT
+
+    typical = intervals[len(intervals) // 2]
+    return max(SEGMENT_GAP_LIMIT, min(30.0, typical * 2.5))
+
+
 def select_segments(start_time, end_time, segments):
     selected = []
     previous = None
@@ -331,17 +434,54 @@ def select_segments(start_time, end_time, segments):
     for ts, path in segments:
         if ts <= start_time:
             previous = (ts, path)
-        if start_time <= ts <= end_time:
+        # A segment starting exactly at end_time belongs entirely to the
+        # period after the requested window and is not needed.
+        if start_time <= ts < end_time:
             selected.append((ts, path))
 
     # The previous segment is needed only when the requested window starts
     # inside it. If a segment starts exactly at start_time it already covers
     # the beginning of the window.
     if previous is not None and (not selected or selected[0][0] > start_time):
-        if start_time - previous[0] <= SEGMENT_GAP_LIMIT:
+        if start_time - previous[0] <= get_segment_gap_limit(segments):
             selected.insert(0, previous)
 
     return selected
+
+
+def find_event_segment(segments, event_time):
+    candidate = None
+
+    for ts, path in segments:
+        if ts <= event_time:
+            candidate = (ts, path)
+        else:
+            break
+
+    if candidate is None and segments:
+        candidate = min(segments, key=lambda item: abs(item[0] - event_time))
+
+    return candidate
+
+
+def create_event_work_dir(base):
+    work_dir = TEMP_DIR / base
+
+    # A retry for the same event replaces the data from the failed attempt.
+    if work_dir.exists():
+        remove_path(work_dir)
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    return work_dir
+
+
+def write_event_log(log_file, oldest_name, copied_segments, event_name):
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(f"{oldest_name}    <- old\n\n")
+
+        for _, path in copied_segments:
+            marker = "    <- event" if path.name == event_name else ""
+            f.write(f"{path.name}{marker}\n")
 
 
 def create_concat_file(concat_file, segments):
@@ -414,6 +554,7 @@ def build_video(work_dir, concat_file, trim_offset, source_fps, normalize=False)
             f"setpts=N/({source_fps:.6f}*TB),"
             f"trim=start={trim_offset:.3f}:duration={TARGET_DURATION:.3f},"
             f"setpts=PTS-STARTPTS",
+            "-t", f"{TARGET_DURATION:.3f}",
         ]
     else:
         command += [
@@ -426,7 +567,7 @@ def build_video(work_dir, concat_file, trim_offset, source_fps, normalize=False)
         "-r", f"{source_fps:.6f}",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-b:v", VIDEO_BITRATE,
+        "-crf", VIDEO_CRF,
         "-maxrate", VIDEO_MAXRATE,
         "-bufsize", VIDEO_BUFSIZE,
         "-pix_fmt", "yuv420p",
@@ -464,40 +605,60 @@ def process_event(event_file):
         delete_event_marker(event_file)
         return True
 
-    start_time = event_time - PRE_EVENT
-    end_time = event_time + POST_EVENT
-
-    if now < end_time:
-        time.sleep(end_time - now)
-
-    segments = wait_for_segments(end_time)
-
-    if not segments:
-        log.warning("No buffer segments available")
-        return False
-
-    newest_time = segments[-1][0]
-    age = time.time() - newest_time
-
-    if age > STALE_BUFFER_SECONDS:
-        log.warning("Buffer is stale; newest segment is %.1fs old: %s", age, datetime.fromtimestamp(newest_time))
-        return False
-
-    selected = select_segments(start_time, end_time, segments)
-
-    if not selected:
-        log.warning("No suitable segments for event %s", event_file.name)
-        return False
-
-    log.info("Event %s: selected %d segment(s)", event_file.name, len(selected))
-
     stamp = datetime.fromtimestamp(event_time).strftime("%Y%m%d_%H%M%S")
     base = f"event_{stamp}_{int(event_time * 1000) % 1000:03d}"
 
-    work_dir = TEMP_DIR / base
-    work_dir.mkdir(parents=True, exist_ok=True)
+    # Create the event data directory immediately. The debug data must remain
+    # available even if the event cannot be processed or the app is restarted.
+    work_dir = create_event_work_dir(base)
+    log.info("Event data directory: %s", work_dir)
 
     try:
+        start_time = event_time - PRE_EVENT
+        end_time = event_time + POST_EVENT
+        wait_until = end_time + SEGMENT_SECONDS * 2.0
+        now = time.time()
+
+        if now < wait_until:
+            delay = wait_until - now
+            log.info(
+                "Event %s: waiting %.1fs before copying segments "
+                "(post %.1fs + 2 x segment %.1fs)",
+                event_file.name, delay, POST_EVENT, SEGMENT_SECONDS
+            )
+            time.sleep(delay)
+
+        segments = wait_for_segments(end_time)
+
+        if not segments:
+            log.warning("No buffer segments available")
+            write_event_log(work_dir / "log.txt", "none", [], None)
+            return False
+
+        oldest_name = segments[0][1].name
+        newest_time = segments[-1][0]
+        age = time.time() - newest_time
+
+        if age > STALE_BUFFER_SECONDS:
+            log.warning("Buffer is stale; newest segment is %.1fs old: %s", age, datetime.fromtimestamp(newest_time))
+            write_event_log(work_dir / "log.txt", oldest_name, [], None)
+            return False
+
+        selected = select_segments(start_time, end_time, segments)
+
+        if not selected:
+            log.warning("No suitable segments for event %s", event_file.name)
+            write_event_log(work_dir / "log.txt", oldest_name, [], None)
+            return False
+
+        event_segment = find_event_segment(segments, event_time)
+        event_name = event_segment[1].name if event_segment is not None else None
+
+        log.info(
+            "Event %s: oldest=%s, event segment=%s, selected=%d",
+            event_file.name, oldest_name, event_name or "none", len(selected)
+        )
+
         # Work on a private copy of the segments. The recorder may still be
         # writing the newest segment and the ring buffer cleanup may remove
         # old files while the video is being built.
@@ -514,9 +675,27 @@ def process_event(event_file):
 
         if not local_segments:
             log.warning("No usable segments copied for event %s", event_file.name)
+            write_event_log(work_dir / "log.txt", oldest_name, [], event_name)
             return False
 
-        log.info("Event %s: copied %d segment(s)", event_file.name, len(local_segments))
+        copied_names = {path.name for _, path in local_segments}
+        if event_name not in copied_names:
+            replacement = find_event_segment(local_segments, event_time)
+            replacement_name = replacement[1].name if replacement is not None else None
+            log.warning(
+                "Event segment %s was not copied; marking %s instead",
+                event_name or "none", replacement_name or "none"
+            )
+            event_name = replacement_name
+
+        write_event_log(
+            work_dir / "log.txt", oldest_name, local_segments, event_name
+        )
+
+        log.info(
+            "Event %s: copied %d segment(s), event data=%s",
+            event_file.name, len(local_segments), work_dir
+        )
 
         concat_file = work_dir / "concat.txt"
         create_concat_file(concat_file, local_segments)
@@ -563,12 +742,23 @@ def process_event(event_file):
             return False
 
         ready_file = READY_DIR / f"{base}.mp4"
+        partial_ready = READY_DIR / f".{base}.mp4.part"
 
         try:
-            output_file.replace(ready_file)
+            # Keep the event copy for diagnostics; only the ready copy is
+            # published. Copy through a temporary name so Home Assistant never
+            # sees a partially written MP4.
+            shutil.copyfile(output_file, partial_ready)
+            partial_ready.replace(ready_file)
         except Exception as e:
-            log.error("Cannot move video to ready: %s", e)
+            try:
+                partial_ready.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log.error("Cannot copy video to ready: %s", e)
             return False
+
+        prune_ready_dir(keep_path=ready_file)
 
         if not publish_mqtt(ready_file):
             return False
@@ -582,19 +772,27 @@ def process_event(event_file):
         return False
 
     finally:
-        try:
-            for path in work_dir.glob("*"):
-                path.unlink(missing_ok=True)
-            work_dir.rmdir()
-        except Exception:
-            pass
+        cleanup_event_data(keep_path=work_dir)
+
+        if DEBUG_MODE:
+            log.info("Event data kept for debugging: %s", work_dir)
+        else:
+            log.info("Event data removed: %s", work_dir)
 
 
 def main():
     log.info("Event processor started")
     log.info("Buffer: %ss, segment: %ss", BUFFER_SECONDS, SEGMENT_SECONDS)
     log.info("Pre-event: %ss, post-event: %ss, target: %ss", PRE_EVENT, POST_EVENT, TARGET_DURATION)
-    log.info("Video bitrate: %s", VIDEO_BITRATE)
+    log.info(
+        "Video quality: CRF %s, maxrate %s, bufsize %s",
+        VIDEO_CRF, VIDEO_MAXRATE, VIDEO_BUFSIZE
+    )
+    log.info(
+        "Debug mode: %s, event data retention: %s day(s)",
+        "on" if DEBUG_MODE else "off", EVENT_DATA_RETENTION_DAYS
+    )
+    log.info("Ready retention: %s day(s)", READY_RETENTION_DAYS)
 
     if PRE_EVENT + POST_EVENT > BUFFER_SECONDS:
         log.warning(
